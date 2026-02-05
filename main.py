@@ -26,10 +26,11 @@ import time
 import random
 from datetime import date
 from pathlib import Path
+from io import StringIO
 
+import requests
 import pandas as pd
 from openai import OpenAI
-from supabase import create_client
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -41,15 +42,14 @@ from selenium.webdriver.support import expected_conditions as EC
 # ENV
 # =====================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+RAILWAY_API_SECRET = os.getenv("RAILWAY_API_SECRET", "").strip()
 
 if OPENAI_API_KEY == "":
     raise RuntimeError("OPENAI_API_KEY missing")
-if SUPABASE_URL == "" or SUPABASE_SERVICE_ROLE_KEY == "":
-    raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing")
+if RAILWAY_API_SECRET == "":
+    raise RuntimeError("RAILWAY_API_SECRET missing")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+MASTER_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/get-railway-csv"
 
 
 # =====================
@@ -64,20 +64,17 @@ SAM_CSV_PATH = DOWNLOAD_DIR / SAM_CSV_NAME
 MASTER_FEED_NAME = "TenderBid_GPT_Enriched_chtgpt4.csv"
 MASTER_LOCAL_PATH = DOWNLOAD_DIR / MASTER_FEED_NAME
 
-BUCKET = "railway-data"
-
 
 # =====================
 # HELPERS
 # =====================
 def read_csv_safely(p: Path) -> pd.DataFrame:
     encodings = ["utf-8", "cp1252", "latin1"]
-    last_err = None
     for enc in encodings:
         try:
             return pd.read_csv(p, encoding=enc, low_memory=False)
-        except UnicodeDecodeError as e:
-            last_err = e
+        except UnicodeDecodeError:
+            pass
     return pd.read_csv(p, encoding="utf-8", errors="replace", low_memory=False)
 
 def wait_for_download(download_dir: Path, timeout_sec: int = 180) -> Path:
@@ -95,25 +92,6 @@ def wait_for_download(download_dir: Path, timeout_sec: int = 180) -> Path:
 
     raise RuntimeError("Download timeout. No finished CSV found.")
 
-def supabase_download_to_path(bucket: str, remote_name: str, local_path: Path) -> bool:
-    try:
-        res = supabase.storage.from_(bucket).download(remote_name)
-        data = res if isinstance(res, (bytes, bytearray)) else getattr(res, "data", None)
-        if not data:
-            return False
-        local_path.write_bytes(data)
-        return True
-    except Exception:
-        return False
-
-def supabase_upload_from_path(bucket: str, remote_name: str, local_path: Path) -> None:
-    with open(local_path, "rb") as f:
-        supabase.storage.from_(bucket).upload(
-            remote_name,
-            f,
-            {"content-type": "text/csv", "upsert": True},
-        )
-
 def clean_text(x, limit: int) -> str:
     if pd.isna(x):
         return ""
@@ -124,18 +102,42 @@ def clean_text(x, limit: int) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:limit]
 
+def master_get_df() -> pd.DataFrame:
+    resp = requests.get(
+        MASTER_ENDPOINT,
+        headers={"x-railway-secret": RAILWAY_API_SECRET},
+        timeout=90,
+    )
+
+    if resp.status_code == 200 and resp.text.strip():
+        return pd.read_csv(StringIO(resp.text), low_memory=False)
+
+    return pd.DataFrame()
+
+def master_put_df(df: pd.DataFrame) -> None:
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    resp = requests.post(
+        MASTER_ENDPOINT,
+        headers={
+            "x-railway-secret": RAILWAY_API_SECRET,
+            "content-type": "text/csv",
+        },
+        data=csv_bytes,
+        timeout=180,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise RuntimeError(f"Master upload failed: {resp.status_code} {resp.text}")
+
 
 # =====================
-# STEP A: DOWNLOAD MASTER FROM SUPABASE
+# STEP A: LOAD MASTER VIA SECURE ENDPOINT
 # =====================
-print("=== MASTER FEED LOAD ===")
-loaded = supabase_download_to_path(BUCKET, MASTER_FEED_NAME, MASTER_LOCAL_PATH)
-if loaded:
-    print(f"Loaded master from Supabase: {MASTER_FEED_NAME}")
-    main_up = read_csv_safely(MASTER_LOCAL_PATH)
+print("=== MASTER FEED LOAD (SECURE ENDPOINT) ===")
+main_up = master_get_df()
+if main_up.empty:
+    print("Master missing or empty. Starting empty.")
 else:
-    print("No master found in Supabase. Starting with empty master.")
-    main_up = pd.DataFrame()
+    print("Master loaded. Rows:", len(main_up))
 
 
 # =====================
@@ -163,6 +165,7 @@ options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.add_argument("--window-size=1920,1080")
 
+print("=== SAM.gov Contract Opportunities Downloader ===")
 driver = webdriver.Chrome(options=options)
 wait = WebDriverWait(driver, 90)
 
@@ -266,7 +269,7 @@ df3 = df3.drop(columns=cols_to_drop, errors="ignore")
 # =====================
 awarded_df = df3.loc[df3["AwardDate"].notna(), ["Sol#", "AwardDate"]].copy()
 
-if not main_up.empty and "Sol#" in main_up.columns:
+if (not main_up.empty) and ("Sol#" in main_up.columns):
     main_up["Sol#"] = main_up["Sol#"].astype(str)
     awarded_df["Sol#"] = awarded_df["Sol#"].astype(str)
 
@@ -283,7 +286,7 @@ df3_open = df3.loc[df3["AwardDate"].isna()].copy()
 df3_open["Sol#"] = df3_open["Sol#"].astype(str)
 
 open_sol = set()
-if not main_up.empty and "Sol#" in main_up.columns and "status" in main_up.columns:
+if (not main_up.empty) and ("Sol#" in main_up.columns) and ("status" in main_up.columns):
     open_sol = set(
         main_up.loc[main_up["status"].eq("open"), "Sol#"]
         .dropna()
@@ -308,7 +311,7 @@ if "ResponseDeadLine" in main_up6.columns:
 
 
 # =====================
-# STEP 5: CLEAN PHONES, EMAILS, NAMES
+# STEP 5: CLEAN PHONES, EMAILS
 # =====================
 def clean_number(num):
     if pd.isna(num):
@@ -482,7 +485,7 @@ if "summary_1_sentence" not in df7.columns:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 idxs = list(df7.index) if RUN_FULL else df7.head(TEST_ROWS).index.tolist()
-if RANDOM_SAMPLE and not RUN_FULL:
+if RANDOM_SAMPLE and (not RUN_FULL):
     random.seed(RANDOM_SEED)
     idxs = random.sample(list(df7.index), min(TEST_ROWS, len(df7.index)))
 
@@ -631,7 +634,7 @@ else:
 
 
 # =====================
-# STEP 10: ALIGN COLUMNS, APPEND, SAVE
+# STEP 10: ALIGN COLUMNS, APPEND
 # =====================
 if main_up.empty:
     main_up = df7.copy()
@@ -653,16 +656,17 @@ else:
     rows_before = len(main_up)
     main_up = pd.concat([main_up, df7], ignore_index=True)
     rows_after = len(main_up)
+
     print("Rows appended:", rows_after - rows_before)
     print("New total rows:", rows_after)
 
+
+# =====================
+# STEP 11: SAVE LOCAL + PUSH MASTER VIA SECURE ENDPOINT
+# =====================
 main_up.to_csv(MASTER_LOCAL_PATH, index=False)
 print("Saved master locally:", str(MASTER_LOCAL_PATH))
 
-
-# =====================
-# STEP 11: UPLOAD MASTER BACK TO SUPABASE FOR LOVABLE
-# =====================
-supabase_upload_from_path(BUCKET, MASTER_FEED_NAME, MASTER_LOCAL_PATH)
-print("Upload to Supabase complete:", MASTER_FEED_NAME)
+master_put_df(main_up)
+print("Master upload done:", MASTER_FEED_NAME)
 
