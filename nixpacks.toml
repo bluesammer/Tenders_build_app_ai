@@ -1,5 +1,2 @@
-http://localhost:8888/tree/upwork/10000k_conrcats_merx_govt_contracts_USA%202026%20-Better
-
-
-Step3_Railway_load_master_update_daily_V3.ipynb
-is just the rail and the only code .master build 
+[phases.setup]
+aptPkgs = ["chromium", "chromium-driver"]
