@@ -33,6 +33,7 @@ import pandas as pd
 from openai import OpenAI
 
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -50,6 +51,10 @@ if RAILWAY_API_SECRET == "":
     raise RuntimeError("RAILWAY_API_SECRET missing")
 
 MASTER_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/get-railway-csv"
+
+# Use system chromium + chromedriver installed by Railway (via nixpacks aptPkgs)
+CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
 
 # =====================
@@ -123,10 +128,45 @@ def master_put_df(df: pd.DataFrame) -> None:
             "content-type": "text/csv",
         },
         data=csv_bytes,
-        timeout=180,
+        timeout=240,
     )
     if resp.status_code not in (200, 201, 204):
         raise RuntimeError(f"Master upload failed: {resp.status_code} {resp.text}")
+
+def ensure_chrome_binaries_exist() -> None:
+    missing = []
+    if not os.path.exists(CHROME_BIN):
+        missing.append(f"CHROME_BIN missing at {CHROME_BIN}")
+    if not os.path.exists(CHROMEDRIVER_PATH):
+        missing.append(f"CHROMEDRIVER_PATH missing at {CHROMEDRIVER_PATH}")
+    if missing:
+        raise RuntimeError(
+            "Chrome runtime missing. Install chromium + chromium-driver via nixpacks aptPkgs. "
+            + " | ".join(missing)
+        )
+
+def build_driver(download_dir: Path) -> webdriver.Chrome:
+    ensure_chrome_binaries_exist()
+
+    options = webdriver.ChromeOptions()
+    prefs = {
+        "download.default_directory": str(download_dir),
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+    }
+    options.add_experimental_option("prefs", prefs)
+
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+
+    options.binary_location = CHROME_BIN
+    service = Service(CHROMEDRIVER_PATH)
+
+    return webdriver.Chrome(service=service, options=options)
 
 
 # =====================
@@ -152,21 +192,7 @@ for f in DOWNLOAD_DIR.glob("*.csv"):
         except Exception:
             pass
 
-options = webdriver.ChromeOptions()
-prefs = {
-    "download.default_directory": str(DOWNLOAD_DIR),
-    "download.prompt_for_download": False,
-    "download.directory_upgrade": True,
-    "safebrowsing.enabled": True,
-}
-options.add_experimental_option("prefs", prefs)
-options.add_argument("--headless=new")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--window-size=1920,1080")
-
-print("=== SAM.gov Contract Opportunities Downloader ===")
-driver = webdriver.Chrome(options=options)
+driver = build_driver(DOWNLOAD_DIR)
 wait = WebDriverWait(driver, 90)
 
 try:
@@ -341,8 +367,6 @@ df5["phone_numbers"] = (
 )
 df5["phone_numbers"] = df5["phone_numbers"].apply(lambda x: None if x == "(000) 000-0000" else x)
 df5 = df5.drop(columns=["primary_phone_clean", "secondary_phone_clean"], errors="ignore")
-
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 
 def clean_emails(*vals):
     emails = []
