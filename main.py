@@ -39,12 +39,6 @@
 #!/usr/bin/env python
 # coding: utf-8   railway_local_combo_v3.ipynb
 
-
-#pull loveabl or local. dothe magic and dump back
-# https://github.com/...../Tenders_build_app_ai
-#eric add the import os  os.environ["OPENAI_API_KEY"] = "sk-proj-T to runlocally
-#MAX_GPT_ROWS_TOTAL = 10      have in railwasy BUT in local uncommen tthis see below
-
 import os
 import re
 import json
@@ -69,57 +63,32 @@ from selenium.webdriver.support import expected_conditions as EC
 # CONFIG
 # =========================================================
 
-# True -> Railway mode (GET open list from Lovable, POST outputs back)
-# False -> Local mode (read open list from LOCAL_OPEN_LIST_PATH, write outputs to disk)
 USE_RAILWAY_MODE = True
 
-# Put OPENAI_API_KEY in your environment.
-# Windows PowerShell:
-#   setx OPENAI_API_KEY "sk-..."
-# Then restart terminal.
-
-
-
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-# Railway secret only needed when USE_RAILWAY_MODE=True
 RAILWAY_API_SECRET = os.getenv("RAILWAY_API_SECRET", "").strip()
 
-# Download SAM file on local
 DOWNLOAD_SAM = True
-
-# Skip SAM download when file already exists and is big enough
 MIN_SAM_BYTES_SKIP_DOWNLOAD = 150_000_000
-
-# Turn GPT off (no API spend)
 DISABLE_GPT = False
 
-# Total GPT rows to process each run
-#MAX_GPT_ROWS_TOTAL = 10      have in railwasy BUT in local uncommen tthis
+# Reads Railway env var. Defaults to 500 if missing.
 MAX_GPT_ROWS_TOTAL = int(os.getenv("MAX_GPT_ROWS_TOTAL", "500"))
 
-# Batch size per GPT request
 GPT_BATCH_SIZE = 25
-
-# GPT model
 MODEL = "gpt-4o-mini"
 
-# GPT tuning
 RANDOM_SAMPLE = False
 RANDOM_SEED = 42
 SKIP_IF_ALREADY_ENRICHED = True
 
-# Per call guardrails
 GPT_TIMEOUT_SEC = 60
 MAX_RETRIES_429 = 8
 PRINT_EVERY_BATCH = 1
 SLEEP_BETWEEN_BATCH_SEC = 0.15
 
-# Hard stop behavior
 STOP_GPT_ON_RPD_LIMIT = True
 
-# Your 8 categories (keep output column named category_20 for compatibility)
 CATEGORY_LIST = [
     "IT and Cyber",
     "Medical and Healthcare",
@@ -132,11 +101,14 @@ CATEGORY_LIST = [
 ]
 
 # Lovable endpoints
-OPEN_LIST_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/get-open-current-csv"
-CLOSED_OUT_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/put-closed-sol-csv"
-NEW_OPEN_OUT_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/put-new-open-enriched-csv"
+OPEN_LIST_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/get-railway-csv"
+UPLOAD_RESULTS_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/upload-railway-results"
 
-# Local open list export
+# Multipart filenames Lovable expects
+CLOSED_REMOTE_FILENAME = "tender_was_open_now_close_live.csv"
+FRESH_REMOTE_FILENAME = "tender_append_fresh_data.csv"
+
+# Local open list export (local mode only)
 LOCAL_OPEN_LIST_PATH = r"C:\Users\Blues\upwork\10000k_conrcats_merx_govt_contracts_USA 2026 -Better\downloads\maybe just swap with same name\tenders_open_current-export-2026-02-09_12-59-53.csv"
 
 
@@ -161,9 +133,9 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SAM_CSV_NAME = "ContractOpportunitiesFullCSV.csv"
 SAM_CSV_PATH = DOWNLOAD_DIR / SAM_CSV_NAME
 
-RUNSTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-CLOSED_OUT_PATH = DOWNLOAD_DIR / f"tenders_now_closed.csv"
-NEW_OPEN_OUT_PATH = DOWNLOAD_DIR / f"tenders_add_fresh.csv"
+# Local disk filenames, no timestamps
+CLOSED_OUT_PATH = DOWNLOAD_DIR / "tenders_now_closed.csv"
+NEW_OPEN_OUT_PATH = DOWNLOAD_DIR / "tenders_add_fresh.csv"
 
 
 # =========================================================
@@ -212,12 +184,13 @@ def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
         return pd.DataFrame()
     return read_csv_safely_text(resp.text)
 
-def http_post_csv(url: str, secret: str, df: pd.DataFrame, timeout: int = 240) -> None:
+def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, filename: str, timeout: int = 240) -> None:
     csv_bytes = df.to_csv(index=False).encode("utf-8")
+    files = {"file": (filename, csv_bytes, "text/csv")}
     resp = requests.post(
         url,
-        headers={"x-railway-secret": secret, "content-type": "text/csv"},
-        data=csv_bytes,
+        headers={"x-railway-secret": secret},
+        files=files,
         timeout=timeout,
     )
     if resp.status_code not in (200, 201, 204):
@@ -358,7 +331,6 @@ KW_CONS1 = re.compile(r"\b(construction|renovation|remodel|hvac|plumbing|roof|ro
 KW_CONS2 = re.compile(r"\b(facilit(y|ies)|building|grounds|janitorial|custodial|maintenance|repair|installation|install|inspection|testing|commissioning|elevator|fire alarm|sprinkler|boiler|chiller)\b", re.I)
 
 KW_TRANS = re.compile(r"\b(logistics|freight|carrier|trucking|courier|fleet|dispatch|drayage|container|intermodal|rail|air cargo|shipping|shipment)\b", re.I)
-
 KW_MANU = re.compile(r"\b(manufactur|fabricat|equipment|machin|parts|components|metal|electronics|vehicle|aerospace|industrial|tooling|assembly)\b", re.I)
 
 KW_PRO1 = re.compile(r"\b(consult|consulting|consultant|advisory|assessment|strategy|roadmap|governance|risk management|change management)\b", re.I)
@@ -444,7 +416,6 @@ def map_category_8_local(row):
 
 def gpt_summary_batch(client: OpenAI, records: list) -> dict:
     payload = {"items": records}
-
     prompt = (
         "You will receive JSON with key items, a list of records.\n"
         "Return JSON with key items, a list of outputs.\n"
@@ -483,6 +454,7 @@ def gpt_summary_batch(client: OpenAI, records: list) -> dict:
 # =========================================================
 
 print("=== STEP 0: LOAD PREVIOUS OPEN LIST ===")
+open_list_loaded_ok = False
 try:
     prev_open_df = load_previous_open_list()
     prev_open_df["Sol#"] = prev_open_df["Sol#"].apply(norm_sol)
@@ -490,9 +462,14 @@ try:
     prev_open_df = prev_open_df.drop_duplicates(subset=["Sol#"], keep="first")
     print("Previous open Sol# count:", len(prev_open_df))
     print("Prev open sample:", prev_open_df["Sol#"].head(5).tolist())
+    open_list_loaded_ok = True
 except Exception as e:
     safe_print_exception("Load previous open list", e)
     prev_open_df = pd.DataFrame({"Sol#": []})
+
+# Hard stop in Railway mode if open list failed
+if USE_RAILWAY_MODE and (open_list_loaded_ok is False):
+    raise RuntimeError("Open list load failed in Railway mode. Aborting to prevent massive append.")
 
 prev_open_set = set(prev_open_df["Sol#"].dropna().astype(str))
 if "" in prev_open_set:
@@ -662,7 +639,7 @@ try:
         award_map = dict(zip(awarded_rows["Sol#"].astype(str), awarded_rows["AwardDate"]))
 
         closed_awarded = sorted(list(prev_open_set.intersection(awarded_set)))
-        
+
         rows = []
         for sol in closed_awarded:
             rows.append({
@@ -670,7 +647,7 @@ try:
                 "close_reason": "awarded",
                 "AwardDate": award_map.get(sol, "")
             })
-        
+
         closed_out_df = pd.DataFrame(rows)
 
     print("Prev open:", len(prev_open_set), "| Open today:", len(open_today_set), "| Closed:", len(closed_out_df))
@@ -687,17 +664,14 @@ except Exception as e:
 print("=== STEP 4: NEW OPEN TO ENRICH (RECENT ONLY) ===")
 
 DEBUG_STEP4 = True
-
 main_up6 = pd.DataFrame()
 
 try:
     if df_recent.empty:
         raise RuntimeError("SAM recent df empty")
 
-    # Normalize Sol#
     df_recent["Sol#"] = df_recent["Sol#"].apply(norm_sol)
 
-    # Open rows
     if "AwardDate" in df_recent.columns:
         df_open_recent = df_recent.loc[df_recent["AwardDate"].isna()].copy()
     else:
@@ -706,7 +680,6 @@ try:
     df_open_recent = df_open_recent.dropna(subset=["Sol#"]).copy()
     df_open_recent = df_open_recent.loc[df_open_recent["Sol#"] != ""].copy()
 
-    # Debug inputs
     if DEBUG_STEP4:
         print("Step4 df_recent rows:", len(df_recent), "cols:", len(df_recent.columns))
         print("Step4 df_open_recent rows:", len(df_open_recent), "cols:", len(df_open_recent.columns))
@@ -714,42 +687,28 @@ try:
         print("Step4 df_open_recent Sol# sample:", df_open_recent["Sol#"].head(5).tolist())
         print("Step4 prev_open sample:", list(sorted(list(prev_open_set)))[:5])
 
-    # Correct boolean mask
     is_prev = df_open_recent["Sol#"].isin(prev_open_set)
     is_new = ~is_prev
 
     if DEBUG_STEP4:
-        print("Step4 is_prev type:", type(is_prev), "len:", len(is_prev))
-        print("Step4 is_new  type:", type(is_new), "len:", len(is_new))
         print("Step4 counts prev:", int(is_prev.sum()), "new:", int(is_new.sum()))
-        print("Step4 mask sample (prev,new):", list(zip(is_prev.head(10).tolist(), is_new.head(10).tolist())))
 
     new_open_df = df_open_recent.loc[is_new].copy()
     print("New open rows (recent):", len(new_open_df))
 
-    # Sort for newest first
     if ("PostedDate" in new_open_df.columns) and (len(new_open_df) > 0):
         new_open_df["PostedDate"] = pd.to_datetime(new_open_df["PostedDate"], errors="coerce", utc=True)
         new_open_df = new_open_df.sort_values("PostedDate", ascending=False)
 
-    # Unique Sol#
     before_dups = len(new_open_df)
     new_open_df = new_open_df.drop_duplicates(subset=["Sol#"], keep="first").copy()
     print("New open unique Sol# (recent):", len(new_open_df), "dropped:", before_dups - len(new_open_df))
 
-    # Reorder columns
     front_cols = ["Sol#", "PostedDate", "ResponseDeadLine"]
     front = [c for c in front_cols if c in new_open_df.columns]
-
-    rest = []
-    for c in new_open_df.columns:
-        if c in front:
-            continue
-        rest.append(c)
-
+    rest = [c for c in new_open_df.columns if c not in front]
     main_up6 = new_open_df.loc[:, front + rest].copy()
 
-    # Normalize date strings
     if "PostedDate" in main_up6.columns:
         main_up6["PostedDate"] = pd.to_datetime(main_up6["PostedDate"], errors="coerce", utc=True).astype(str).str[:10]
     if "ResponseDeadLine" in main_up6.columns:
@@ -757,12 +716,10 @@ try:
 
     if DEBUG_STEP4:
         print("Step4 main_up6 rows:", len(main_up6))
-        print("Step4 main_up6 cols:", main_up6.columns.tolist())
 
 except Exception as e:
     safe_print_exception("New-open detection", e)
     main_up6 = pd.DataFrame()
-
 
 
 # =========================================================
@@ -919,8 +876,7 @@ else:
 
 
 # =========================================================
-# STEP 8: GPT SUMMARY ONLY
-# STEP 9: LOCAL CATEGORY (8)
+# STEP 8: GPT SUMMARY ONLY + STEP 9: LOCAL CATEGORY (8)
 # =========================================================
 
 print("=== STEP 8: GPT SUMMARY ONLY + STEP 9: LOCAL CATEGORY (8) ===")
@@ -951,7 +907,6 @@ if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
     if OUT_CAT not in df7.columns:
         df7[OUT_CAT] = ""
 
-    # Step 8 summary
     if DISABLE_GPT is True:
         print("GPT disabled. Using fallback summaries.")
         for i in df7.index.tolist():
@@ -1045,7 +1000,6 @@ if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
 
         print("GPT summary finished. rows processed:", processed_rows, "gpt_stop_flag:", gpt_stop_flag)
 
-    # Step 9 category local
     if "PSC CODE" not in df7.columns:
         if "ClassificationCode" in df7.columns:
             df7["PSC CODE"] = df7["ClassificationCode"].astype(str)
@@ -1094,17 +1048,29 @@ except Exception as e:
 print("=== STEP 11: PUSH OUTPUTS (RAILWAY MODE) ===")
 if USE_RAILWAY_MODE:
     try:
-        http_post_csv(CLOSED_OUT_ENDPOINT, RAILWAY_API_SECRET, closed_out_df, timeout=240)
+        http_post_csv_multipart(
+            UPLOAD_RESULTS_ENDPOINT,
+            RAILWAY_API_SECRET,
+            closed_out_df,
+            CLOSED_REMOTE_FILENAME,
+            timeout=240
+        )
         print("Pushed closed file.")
     except Exception as e:
         safe_print_exception("Push closed file", e)
 
     try:
         df_to_push = df7 if isinstance(df7, pd.DataFrame) else pd.DataFrame()
-        http_post_csv(NEW_OPEN_OUT_ENDPOINT, RAILWAY_API_SECRET, df_to_push, timeout=240)
-        print("Pushed new enriched file.")
+        http_post_csv_multipart(
+            UPLOAD_RESULTS_ENDPOINT,
+            RAILWAY_API_SECRET,
+            df_to_push,
+            FRESH_REMOTE_FILENAME,
+            timeout=240
+        )
+        print("Pushed fresh file.")
     except Exception as e:
-        safe_print_exception("Push new enriched file", e)
+        safe_print_exception("Push fresh file", e)
 else:
     print("Local mode. Skipped pushes.")
 
