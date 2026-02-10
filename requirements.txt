@@ -1,6 +1,5 @@
 pandas>=2.1
 selenium>=4.17
 openai>=1.12
-supabase>=2.3
-python-dateutil>=2.8
 requests>=2.31
+python-dateutil>=2.8

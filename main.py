@@ -1,30 +1,48 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
+# wo things you still need to wire on the Lovable side.
+# 
+# get-open-current-csv, returns a CSV with column sol_number (or Sol#)
+# 
+# put-closed-sol-csv and put-new-open-enriched-csv, accept CSV upload and store it in Storage or load it into tables for your combine step
+# 
+# If you already have only one endpoint, tell me its name and I will align the script URLs and request headers to match it.
+# 
 
+# You want a single script with a top switch.
+# 
+# You want two outputs every run.
+# 
+# closed file, Sol# that were open yesterday, now awarded or missing from today’s open set
+# 
+# new open enriched file, only brand new open Sol# since yesterday, with your cleaning + GPT columns
+# 
+# You also want these rules.
+# 
+# Railway mode pulls the open list CSV from Lovable, pushes two CSV outputs back to Lovable
+# 
+# Local mode reads the open list CSV from your Windows path, writes the two outputs locally
+# 
+# GPT category must use your fixed 20 list, no “learn from master”
+# 
+# If a step fails, keep going and still produce the two output files, push what exists
+# 
+# Below is a full drop-in script. Change only the CONFIG section.
 
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
+# In[3]:
 
 
 #!/usr/bin/env python
-# coding: utf-8
-
+# coding: utf-8   railway_local_combo_v3.ipynb
+#pull loveabl or local. dothe magic and dump back
+# https://github.com/...../Tenders_build_app_ai
 import os
 import re
 import json
 import time
 import random
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from io import StringIO
 
@@ -39,41 +57,120 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-# =====================
-# ENV
-# =====================
+# =========================================================
+# CONFIG
+# =========================================================
+
+# True -> Railway mode (GET open list from Lovable, POST outputs back)
+# False -> Local mode (read open list from LOCAL_OPEN_LIST_PATH, write outputs to disk)
+USE_RAILWAY_MODE = True
+
+# Put OPENAI_API_KEY in your environment.
+# Windows PowerShell:
+#   setx OPENAI_API_KEY "sk-..."
+# Then restart terminal.
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+# Railway secret only needed when USE_RAILWAY_MODE=True
 RAILWAY_API_SECRET = os.getenv("RAILWAY_API_SECRET", "").strip()
 
-if OPENAI_API_KEY == "":
-    raise RuntimeError("OPENAI_API_KEY missing")
-if RAILWAY_API_SECRET == "":
-    raise RuntimeError("RAILWAY_API_SECRET missing")
+# Download SAM file on local
+DOWNLOAD_SAM = True
 
-MASTER_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/get-railway-csv"
+# Skip SAM download when file already exists and is big enough
+MIN_SAM_BYTES_SKIP_DOWNLOAD = 150_000_000
 
-# Use system chromium + chromedriver installed by Railway (via nixpacks aptPkgs)
-CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium")
-CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+# Turn GPT off (no API spend)
+DISABLE_GPT = False
+
+# Total GPT rows to process each run
+MAX_GPT_ROWS_TOTAL = 10
+
+# Batch size per GPT request
+GPT_BATCH_SIZE = 25
+
+# GPT model
+MODEL = "gpt-4o-mini"
+
+# GPT tuning
+RANDOM_SAMPLE = False
+RANDOM_SEED = 42
+SKIP_IF_ALREADY_ENRICHED = True
+
+# Per call guardrails
+GPT_TIMEOUT_SEC = 60
+MAX_RETRIES_429 = 8
+PRINT_EVERY_BATCH = 1
+SLEEP_BETWEEN_BATCH_SEC = 0.15
+
+# Hard stop behavior
+STOP_GPT_ON_RPD_LIMIT = True
+
+# Your 8 categories (keep output column named category_20 for compatibility)
+CATEGORY_LIST = [
+    "IT and Cyber",
+    "Medical and Healthcare",
+    "Energy and Utilities",
+    "Professional Services",
+    "Construction and Trades",
+    "Transportation and Logistics",
+    "Manufacturing",
+    "Other",
+]
+
+# Lovable endpoints
+OPEN_LIST_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/get-open-current-csv"
+CLOSED_OUT_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/put-closed-sol-csv"
+NEW_OPEN_OUT_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/put-new-open-enriched-csv"
+
+# Local open list export
+LOCAL_OPEN_LIST_PATH = r"C:\Users\Blues\upwork\10000k_conrcats_merx_govt_contracts_USA 2026 -Better\downloads\maybe just swap with same name\tenders_open_current-export-2026-02-09_12-59-53.csv"
 
 
-# =====================
+# =========================================================
+# VALIDATION
+# =========================================================
+
+if (DISABLE_GPT is False) and (OPENAI_API_KEY == ""):
+    raise RuntimeError("OPENAI_API_KEY missing in environment")
+
+if USE_RAILWAY_MODE and (RAILWAY_API_SECRET == ""):
+    raise RuntimeError("RAILWAY_API_SECRET missing for Railway mode")
+
+
+# =========================================================
 # PATHS
-# =====================
+# =========================================================
+
 DOWNLOAD_DIR = Path("downloads").resolve()
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 SAM_CSV_NAME = "ContractOpportunitiesFullCSV.csv"
 SAM_CSV_PATH = DOWNLOAD_DIR / SAM_CSV_NAME
 
-MASTER_FEED_NAME = "TenderBid_GPT_Enriched_chtgpt4.csv"
-MASTER_LOCAL_PATH = DOWNLOAD_DIR / MASTER_FEED_NAME
+RUNSTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+CLOSED_OUT_PATH = DOWNLOAD_DIR / f"tenders_closed_from_open_{RUNSTAMP}.csv"
+NEW_OPEN_OUT_PATH = DOWNLOAD_DIR / f"tenders_new_open_enriched_{RUNSTAMP}.csv"
 
 
-# =====================
+# =========================================================
 # HELPERS
-# =====================
-def read_csv_safely(p: Path) -> pd.DataFrame:
+# =========================================================
+
+def bytes_human(n: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    f = float(n)
+    for u in units:
+        if f < 1024.0:
+            return f"{f:.1f}{u}"
+        f /= 1024.0
+    return f"{f:.1f}TB"
+
+def safe_print_exception(tag: str, e: Exception) -> None:
+    print(f"[ERROR] {tag}: {type(e).__name__}: {e}")
+
+def read_csv_safely_path(p: Path) -> pd.DataFrame:
     encodings = ["utf-8", "cp1252", "latin1"]
     for enc in encodings:
         try:
@@ -82,22 +179,8 @@ def read_csv_safely(p: Path) -> pd.DataFrame:
             pass
     return pd.read_csv(p, encoding="utf-8", errors="replace", low_memory=False)
 
-
-def wait_for_download(download_dir: Path, timeout_sec: int = 180) -> Path:
-    start = time.time()
-    while time.time() - start < timeout_sec:
-        csvs = list(download_dir.glob("*.csv"))
-        partials = list(download_dir.glob("*.crdownload")) + list(download_dir.glob("*.tmp"))
-
-        if len(csvs) > 0 and len(partials) == 0:
-            newest = max(csvs, key=lambda x: x.stat().st_mtime)
-            if newest.stat().st_size > 0:
-                return newest
-
-        time.sleep(1)
-
-    raise RuntimeError("Download timeout. No finished CSV found.")
-
+def read_csv_safely_text(text: str) -> pd.DataFrame:
+    return pd.read_csv(StringIO(text), low_memory=False)
 
 def clean_text(x, limit: int) -> str:
     if pd.isna(x):
@@ -109,51 +192,53 @@ def clean_text(x, limit: int) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:limit]
 
+def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
+    resp = requests.get(url, headers={"x-railway-secret": secret}, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"GET failed {resp.status_code}: {resp.text[:500]}")
+    if resp.text.strip() == "":
+        return pd.DataFrame()
+    return read_csv_safely_text(resp.text)
 
-def master_get_df() -> pd.DataFrame:
-    resp = requests.get(
-        MASTER_ENDPOINT,
-        headers={"x-railway-secret": RAILWAY_API_SECRET},
-        timeout=90,
-    )
-
-    if resp.status_code == 200 and resp.text.strip():
-        return pd.read_csv(StringIO(resp.text), low_memory=False)
-
-    return pd.DataFrame()
-
-
-def master_put_df(df: pd.DataFrame) -> None:
+def http_post_csv(url: str, secret: str, df: pd.DataFrame, timeout: int = 240) -> None:
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     resp = requests.post(
-        MASTER_ENDPOINT,
-        headers={
-            "x-railway-secret": RAILWAY_API_SECRET,
-            "content-type": "text/csv",
-        },
+        url,
+        headers={"x-railway-secret": secret, "content-type": "text/csv"},
         data=csv_bytes,
-        timeout=240,
+        timeout=timeout,
     )
     if resp.status_code not in (200, 201, 204):
-        raise RuntimeError(f"Master upload failed: {resp.status_code} {resp.text}")
+        raise RuntimeError(f"POST failed {resp.status_code}: {resp.text[:500]}")
 
+def load_previous_open_list() -> pd.DataFrame:
+    if USE_RAILWAY_MODE:
+        df_open = http_get_csv_df(OPEN_LIST_ENDPOINT, RAILWAY_API_SECRET, timeout=90)
+    else:
+        df_open = read_csv_safely_path(Path(LOCAL_OPEN_LIST_PATH))
 
-def ensure_chrome_binaries_exist() -> None:
-    missing = []
-    if not os.path.exists(CHROME_BIN):
-        missing.append(f"CHROME_BIN missing at {CHROME_BIN}")
-    if not os.path.exists(CHROMEDRIVER_PATH):
-        missing.append(f"CHROMEDRIVER_PATH missing at {CHROMEDRIVER_PATH}")
-    if missing:
-        raise RuntimeError(
-            "Chrome runtime missing. Install chromium + chromium-driver via nixpacks aptPkgs. "
-            + " | ".join(missing)
-        )
+    if df_open.empty:
+        return pd.DataFrame({"Sol#": []})
 
+    df_open.columns = [c.strip() for c in df_open.columns]
+
+    if "Sol#" in df_open.columns:
+        out = df_open[["Sol#"]].copy()
+    elif "sol_number" in df_open.columns:
+        out = df_open.rename(columns={"sol_number": "Sol#"})[["Sol#"]].copy()
+    else:
+        first = df_open.columns[0]
+        out = df_open.rename(columns={first: "Sol#"})[["Sol#"]].copy()
+
+    out["Sol#"] = out["Sol#"].astype(str).str.strip()
+    out = out.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "(blank)": pd.NA})
+    out = out.dropna(subset=["Sol#"]).drop_duplicates(subset=["Sol#"], keep="first")
+    return out
+
+CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
 def build_driver(download_dir: Path) -> webdriver.Chrome:
-    ensure_chrome_binaries_exist()
-
     options = webdriver.ChromeOptions()
     prefs = {
         "download.default_directory": str(download_dir),
@@ -163,230 +248,517 @@ def build_driver(download_dir: Path) -> webdriver.Chrome:
     }
     options.add_experimental_option("prefs", prefs)
 
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
+    if USE_RAILWAY_MODE:
+        if (os.path.exists(CHROME_BIN) is False) or (os.path.exists(CHROMEDRIVER_PATH) is False):
+            raise RuntimeError(f"Chrome runtime missing: {CHROME_BIN} or {CHROMEDRIVER_PATH}")
 
-    options.binary_location = CHROME_BIN
-    service = Service(CHROMEDRIVER_PATH)
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.binary_location = CHROME_BIN
+        service = Service(CHROMEDRIVER_PATH)
+        return webdriver.Chrome(service=service, options=options)
 
-    return webdriver.Chrome(service=service, options=options)
+    options.add_argument("--start-maximized")
+    return webdriver.Chrome(options=options)
+
+def wait_for_file_stable(path: Path, timeout_sec: int = 1200, stable_sec: int = 20, min_bytes: int = 50_000_000) -> None:
+    start = time.time()
+    last_size = -1
+    stable_start = None
+
+    while (time.time() - start) < timeout_sec:
+        if path.exists():
+            size = path.stat().st_size
+            if size >= min_bytes:
+                if size == last_size:
+                    if stable_start is None:
+                        stable_start = time.time()
+                    elif (time.time() - stable_start) >= stable_sec:
+                        return
+                else:
+                    stable_start = None
+                last_size = size
+        time.sleep(2)
+
+    raise RuntimeError(f"Timeout waiting for stable file: {path}")
+
+def norm_sol(x) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    s = s.replace("\u00a0", " ").strip()
+    if (len(s) >= 2) and (s[0] == "(") and (s[-1] == ")"):
+        s = s[1:-1].strip()
+    if s.startswith("-"):
+        s = s[1:].strip()
+    s = re.sub(r"[^A-Za-z0-9\-]", "", s)
+    return s.upper().strip()
+
+def validate_summary(summary: str) -> str:
+    s = re.sub(r"\s+", " ", str(summary)).strip()
+    if len(s) > 260:
+        s = s[:260].rstrip()
+    if "." in s:
+        first = s.split(".", 1)[0].strip()
+        if first != "":
+            s = first + "."
+    return s
+
+def fallback_summary(title: str, desc: str) -> str:
+    t = clean_text(title, 140)
+    d = clean_text(desc, 220)
+    if t != "":
+        return validate_summary(f"Provide {t.lower()}.")
+    if d != "":
+        base = d
+        if base.endswith(".") is False:
+            base = base + "."
+        return validate_summary("Provide " + base)
+    return "Provide requested goods or services."
+
+def chunk_list(items, chunk_size: int):
+    out = []
+    i = 0
+    while i < len(items):
+        out.append(items[i:i + chunk_size])
+        i += chunk_size
+    return out
+
+def detect_retry_after_seconds(err: Exception) -> float:
+    msg = str(err)
+    m = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", msg, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    return 10.0
 
 
-def bytes_human(n: int) -> str:
-    units = ["B", "KB", "MB", "GB"]
-    f = float(n)
-    for u in units:
-        if f < 1024.0:
-            return f"{f:.1f}{u}"
-        f /= 1024.0
-    return f"{f:.1f}TB"
+# =========================================================
+# CATEGORY (8) RULE ENGINE
+# =========================================================
+
+KW_MED = re.compile(r"\b(medical|clinical|hospital|pharma|pharmaceutical|drug|laborator(y|ies)|diagnostic|patient|clinic|healthcare|nursing)\b", re.I)
+KW_ENERGY = re.compile(r"\b(energy|utility|utilities|power|electric|electricity|solar|wind|generator|fuel|grid|substation|transformer)\b", re.I)
+
+KW_CONS1 = re.compile(r"\b(construction|renovation|remodel|hvac|plumbing|roof|roofing|concrete|asphalt|paving|carpentry|drywall)\b", re.I)
+KW_CONS2 = re.compile(r"\b(facilit(y|ies)|building|grounds|janitorial|custodial|maintenance|repair|installation|install|inspection|testing|commissioning|elevator|fire alarm|sprinkler|boiler|chiller)\b", re.I)
+
+KW_TRANS = re.compile(r"\b(logistics|freight|carrier|trucking|courier|fleet|dispatch|drayage|container|intermodal|rail|air cargo|shipping|shipment)\b", re.I)
+
+KW_MANU = re.compile(r"\b(manufactur|fabricat|equipment|machin|parts|components|metal|electronics|vehicle|aerospace|industrial|tooling|assembly)\b", re.I)
+
+KW_PRO1 = re.compile(r"\b(consult|consulting|consultant|advisory|assessment|strategy|roadmap|governance|risk management|change management)\b", re.I)
+KW_PRO2 = re.compile(r"\b(staffing|recruit|recruiting|talent|\bhr\b|payroll|accounting|bookkeep|legal|compliance|audit)\b", re.I)
+KW_PRO3 = re.compile(r"\b(training services|training|curriculum|instructional|instructor|facilitat|workshop|conference|event)\b", re.I)
+KW_PRO4 = re.compile(r"\b(administrat|admin|program support|technical assistance|analysis|research|evaluation|policy|communications|outreach|public affairs|writing|editing|translation|interpreting|records management|data entry)\b", re.I)
+KW_PRO5 = re.compile(r"\b(managed services|service desk|help desk|call center|contact center|back office)\b", re.I)
+
+KW_IT_STRONG = re.compile(r"\b(cyber|infosec|\bsoc\b|siem|zero trust|firewall|vpn|edr|iam|mfa|penetration|vulnerability|cisa|nist)\b", re.I)
+KW_IT_MED = re.compile(r"\b(software|saas|cloud|azure|aws|gcp|kubernetes|devops|api|database|crm|erp|helpdesk|it support|endpoint|microsoft 365|\bo365\b)\b", re.I)
+KW_IT_WEAK = re.compile(r"\b(data|server|network)\b", re.I)
+
+def psc_prefix(x):
+    s = str(x).strip().upper()
+    return s[0] if len(s) > 0 else ""
+
+def text_blob_raw(r):
+    parts = [
+        str(r.get("PRODUCT AND SERVICE CODE NAME", "")),
+        str(r.get("2022 NAICS Title", "")),
+        str(r.get("Title", "")),
+        str(r.get("Description", "")),
+    ]
+    return " ".join(parts).lower()
+
+def is_it(text):
+    if KW_IT_STRONG.search(text):
+        return True
+    if KW_IT_MED.search(text):
+        return True
+    if KW_IT_WEAK.search(text) and KW_IT_MED.search(text):
+        return True
+    return False
+
+def is_cons(text):
+    return bool(KW_CONS1.search(text) or KW_CONS2.search(text))
+
+def is_pro(text):
+    return bool(
+        KW_PRO1.search(text) or
+        KW_PRO2.search(text) or
+        KW_PRO3.search(text) or
+        KW_PRO4.search(text) or
+        KW_PRO5.search(text)
+    )
+
+def map_category_8_local(row):
+    p = psc_prefix(row.get("PSC CODE", ""))
+    t = text_blob_raw(row)
+
+    if is_it(t):
+        return "IT and Cyber"
+    if KW_MED.search(t):
+        return "Medical and Healthcare"
+    if KW_ENERGY.search(t):
+        return "Energy and Utilities"
+    if is_pro(t):
+        return "Professional Services"
+    if is_cons(t):
+        return "Construction and Trades"
+    if KW_TRANS.search(t):
+        return "Transportation and Logistics"
+    if KW_MANU.search(t):
+        return "Manufacturing"
+
+    if p == "D":
+        return "Professional Services"
+    if p in ["J", "S", "Y"]:
+        return "Construction and Trades"
+    if p == "N":
+        return "Medical and Healthcare"
+    if (p in ["F", "G", "H", "K"]) or p.isdigit():
+        return "Manufacturing"
+    if p in ["R", "T"]:
+        return "Professional Services"
+
+    return "Other"
 
 
-# =====================
-# STEP A: LOAD MASTER VIA SECURE ENDPOINT
-# =====================
-print("=== MASTER FEED LOAD (SECURE ENDPOINT) ===")
-main_up = master_get_df()
-if main_up.empty:
-    print("Master missing or empty. Starting empty.")
-else:
-    print("Master loaded. Rows:", len(main_up))
-    print("Master columns:", len(main_up.columns))
-    print("Master first cols:", list(main_up.columns)[:12])
+# =========================================================
+# GPT SUMMARY ONLY
+# =========================================================
+
+def gpt_summary_batch(client: OpenAI, records: list) -> dict:
+    payload = {"items": records}
+
+    prompt = (
+        "You will receive JSON with key items, a list of records.\n"
+        "Return JSON with key items, a list of outputs.\n"
+        "Each output must include: Sol#, summary_1_sentence.\n\n"
+        "summary_1_sentence rules:\n"
+        "One sentence.\n"
+        "Start with Provide or Deliver or Install or Maintain or Supply.\n"
+        "Describe what is being purchased.\n"
+        "Avoid procurement language.\n"
+        "Avoid mentioning RFQ, solicitation, BPA, BAA, FAR, DFARS, amendments, deadlines, NAICS, set-aside.\n"
+        "Max 260 chars.\n\n"
+        "Input JSON:\n"
+        + json.dumps(payload)
+    )
+
+    resp = client.responses.create(
+        model=MODEL,
+        input=prompt,
+        text={"format": {"type": "json_object"}},
+        timeout=GPT_TIMEOUT_SEC,
+    )
+
+    data = json.loads(resp.output_text)
+    out_items = data.get("items", [])
+    out_map = {}
+    for it in out_items:
+        sol = norm_sol(it.get("Sol#", ""))
+        if sol == "":
+            continue
+        out_map[sol] = validate_summary(it.get("summary_1_sentence", ""))
+    return out_map
 
 
-# =====================
-# STEP 1: SAM.GOV DOWNLOAD (KEEP THESE STEPS)
-# =====================
-print("=== SAM.gov Contract Opportunities Downloader ===")
+# =========================================================
+# STEP 0: LOAD PREVIOUS OPEN LIST
+# =========================================================
 
-for f in DOWNLOAD_DIR.glob("*.csv"):
-    if f.name != MASTER_FEED_NAME:
-        try:
-            f.unlink()
-        except Exception:
-            pass
-
-print("Chrome bin:", CHROME_BIN, "| exists:", os.path.exists(CHROME_BIN))
-print("Chromedriver:", CHROMEDRIVER_PATH, "| exists:", os.path.exists(CHROMEDRIVER_PATH))
-print("Download dir:", str(DOWNLOAD_DIR))
-
-driver = build_driver(DOWNLOAD_DIR)
-wait = WebDriverWait(driver, 90)
-
+print("=== STEP 0: LOAD PREVIOUS OPEN LIST ===")
 try:
-    print("STEP 1: Browser launched. Navigating to SAM.gov page...")
-    driver.get("https://sam.gov/data-services/Contract%20Opportunities/datagov?privacy=Public")
+    prev_open_df = load_previous_open_list()
+    prev_open_df["Sol#"] = prev_open_df["Sol#"].apply(norm_sol)
+    prev_open_df = prev_open_df.loc[prev_open_df["Sol#"] != ""].copy()
+    prev_open_df = prev_open_df.drop_duplicates(subset=["Sol#"], keep="first")
+    print("Previous open Sol# count:", len(prev_open_df))
+    print("Prev open sample:", prev_open_df["Sol#"].head(5).tolist())
+except Exception as e:
+    safe_print_exception("Load previous open list", e)
+    prev_open_df = pd.DataFrame({"Sol#": []})
 
-    wait.until(lambda d: "SAM.gov" in d.title)
-    print("STEP 2: Page title loaded:", driver.title)
+prev_open_set = set(prev_open_df["Sol#"].dropna().astype(str))
+if "" in prev_open_set:
+    prev_open_set.remove("")
 
-    print("STEP 3: Waiting for dataset list...")
-    wait.until(lambda d: "ContractOpportunitiesFullCSV" in d.page_source)
-    print("STEP 3a: Dataset list detected")
 
-    csv_elem = driver.find_element(By.XPATH, "//*[contains(text(),'ContractOpportunitiesFullCSV.csv')]")
-    driver.execute_script("arguments[0].scrollIntoView(true);", csv_elem)
-    time.sleep(1)
+# =========================================================
+# STEP 1: SAM.GOV DOWNLOAD
+# =========================================================
 
-    print("STEP 4: Clicking CSV link...")
-    driver.execute_script(
-        """
-        var el = arguments[0];
-        var evt = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
-        el.dispatchEvent(evt);
-        """,
-        csv_elem
-    )
+print("=== STEP 1: SAM.GOV DOWNLOAD ===")
 
-    print("STEP 5: Waiting for popup modal...")
-    modal = WebDriverWait(driver, 20).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, ".sds-dialog-content.height-mobile"))
-    )
-
-    for _ in range(7):
-        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", modal)
-        time.sleep(1)
+if (DOWNLOAD_SAM is True) and SAM_CSV_PATH.exists() and (SAM_CSV_PATH.stat().st_size >= MIN_SAM_BYTES_SKIP_DOWNLOAD):
+    print("SAM file already present and large enough. Skipping download.")
+else:
+    if DOWNLOAD_SAM is True:
+        driver = None
         try:
-            accept_button = driver.find_element(By.XPATH, "//button[@class='usa-button' and normalize-space()='Accept']")
-            if accept_button.is_enabled():
-                print("STEP 6: Accept button detected and enabled. Clicking...")
-                accept_button.click()
-                print("STEP 7: Terms accepted successfully.")
-                break
-        except Exception:
-            pass
+            driver = build_driver(DOWNLOAD_DIR)
+            wait = WebDriverWait(driver, 90)
 
-    time.sleep(2)
+            print("Browser launched. Navigating to SAM.gov dataset page...")
+            driver.get("https://sam.gov/data-services/Contract%20Opportunities/datagov?privacy=Public")
 
-    print("STEP 8: Clicking CSV link again to start actual download...")
-    csv_elem2 = WebDriverWait(driver, 20).until(
-        EC.element_to_be_clickable((By.XPATH, "//*[contains(text(),'ContractOpportunitiesFullCSV.csv')]"))
-    )
-    csv_elem2.click()
+            wait.until(lambda d: "SAM.gov" in d.title)
+            print("Page title:", driver.title)
 
-    print("STEP 9: Waiting for file to download...")
-    downloaded = wait_for_download(DOWNLOAD_DIR, timeout_sec=240)
-    print("Download complete:", downloaded.name)
+            print("Waiting for dataset list...")
+            wait.until(lambda d: "ContractOpportunitiesFullCSV" in d.page_source)
 
-finally:
-    driver.quit()
-    print("=== DOWNLOAD STEP DONE ===")
+            csv_elem = driver.find_element(By.XPATH, "//*[contains(text(),'ContractOpportunitiesFullCSV.csv')]")
+            driver.execute_script("arguments[0].scrollIntoView(true);", csv_elem)
+            time.sleep(1)
 
-print("SAM_CSV_PATH:", str(SAM_CSV_PATH))
-print("SAM exists:", SAM_CSV_PATH.exists())
+            print("Clicking CSV link...")
+            driver.execute_script(
+                """
+                var el = arguments[0];
+                var evt = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
+                el.dispatchEvent(evt);
+                """,
+                csv_elem
+            )
+
+            print("Waiting for terms modal...")
+            modal = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".sds-dialog-content.height-mobile"))
+            )
+
+            accepted = False
+            for _ in range(7):
+                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", modal)
+                time.sleep(1)
+                try:
+                    accept_button = driver.find_element(By.XPATH, "//button[@class='usa-button' and normalize-space()='Accept']")
+                    if accept_button.is_enabled():
+                        accept_button.click()
+                        accepted = True
+                        break
+                except Exception:
+                    pass
+
+            if accepted is True:
+                print("Terms accepted.")
+            else:
+                print("Terms modal skipped or already accepted.")
+
+            time.sleep(2)
+
+            print("Clicking CSV link again to start download...")
+            csv_elem2 = WebDriverWait(driver, 20).until(
+                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(),'ContractOpportunitiesFullCSV.csv')]"))
+            )
+            csv_elem2.click()
+
+            print("Waiting for SAM file to become stable...")
+            wait_for_file_stable(SAM_CSV_PATH, timeout_sec=1200, stable_sec=20, min_bytes=50_000_000)
+            print("SAM file stable:", str(SAM_CSV_PATH))
+
+        except Exception as e:
+            safe_print_exception("SAM download", e)
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+    else:
+        print("DOWNLOAD_SAM=False. Using existing file.")
+
+print("SAM_CSV_PATH:", str(SAM_CSV_PATH), "| exists:", SAM_CSV_PATH.exists())
 if SAM_CSV_PATH.exists():
     print("SAM size:", bytes_human(SAM_CSV_PATH.stat().st_size))
 
 
-# =====================
-# STEP 2: LOAD SAM CSV AND FILTER
-# =====================
-print("=== STEP 2: LOAD + FILTER SAM ===")
-df = read_csv_safely(SAM_CSV_PATH)
-print("SAM raw rows:", len(df), "| cols:", len(df.columns))
+# =========================================================
+# STEP 2: LOAD SAM (FULL) + BUILD RECENT (6 MONTHS)
+# =========================================================
 
-df2 = df.copy()
-df2["PostedDate"] = pd.to_datetime(df2["PostedDate"], errors="coerce", utc=True)
-cutoff = pd.Timestamp.now(tz="UTC") - pd.DateOffset(months=6)
-df3 = df2.loc[df2["PostedDate"].notna() & (df2["PostedDate"] >= cutoff)].copy()
-print("Rows after 6-month filter:", len(df3))
+print("=== STEP 2: LOAD SAM (FULL) + RECENT FILTER ===")
 
-cols_to_drop = [
-    "ArchiveType",
-    "OrganizationType",
-    "NoticeId",
-    "AdditionalInfoLink",
-    "Award$",
-    "Awardee",
-    "AwardNumber",
-    "PopCity",
-    "PopCountry",
-    "PopState",
-    "PopStreetAddress",
-    "PopZip",
-    "PrimaryContactFax",
-    "PrimaryContactTitle",
-    "SecondaryContactFax",
-    "SecondaryContactTitle",
-    "SetASide",
-    "SetASideCode",
-    "CGAC", "FPDS Code", "AAC Code", "ZipCode", "CountryCode", "Type",
-    "BaseType", "Office", "Department/Ind.Agency", "ArchiveDate"
-]
-before_cols = len(df3.columns)
-df3 = df3.drop(columns=cols_to_drop, errors="ignore")
-print("Dropped cols requested:", len(cols_to_drop), "| cols before:", before_cols, "| cols after:", len(df3.columns))
+df_full = pd.DataFrame()
+df_recent = pd.DataFrame()
 
+try:
+    if SAM_CSV_PATH.exists() is False:
+        raise RuntimeError("SAM CSV missing")
 
-# =====================
-# STEP 3: CLOSE AWARDED SOL#
-# =====================
-print("=== STEP 3: CLOSE AWARDED SOL# ===")
-awarded_df = df3.loc[df3["AwardDate"].notna(), ["Sol#", "AwardDate"]].copy()
-print("Awarded rows in SAM (AwardDate present):", len(awarded_df))
+    df_full = read_csv_safely_path(SAM_CSV_PATH)
+    print("SAM raw rows:", len(df_full), "| cols:", len(df_full.columns))
 
-if (not main_up.empty) and ("Sol#" in main_up.columns):
-    main_up["Sol#"] = main_up["Sol#"].astype(str)
-    awarded_df["Sol#"] = awarded_df["Sol#"].astype(str)
+    if "Sol#" not in df_full.columns:
+        raise RuntimeError("SAM missing Sol# column")
 
-    if "status" not in main_up.columns:
-        main_up["status"] = "open"
+    df_full["Sol#"] = df_full["Sol#"].apply(norm_sol)
 
-    closed_before = (main_up["status"].astype(str) == "closed").sum() if "status" in main_up.columns else 0
-    main_up.loc[main_up["Sol#"].isin(awarded_df["Sol#"]), "status"] = "closed"
-    closed_after = (main_up["status"].astype(str) == "closed").sum()
-    print("Master closed count before:", int(closed_before), "| after:", int(closed_after))
-else:
-    print("Master missing Sol# column. Skipping close-out.")
+    if "PostedDate" in df_full.columns:
+        tmp = df_full.copy()
+        tmp["PostedDate"] = pd.to_datetime(tmp["PostedDate"], errors="coerce", utc=True)
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.DateOffset(months=6)
+        df_recent = tmp.loc[tmp["PostedDate"].notna() & (tmp["PostedDate"] >= cutoff)].copy()
+    else:
+        df_recent = df_full.copy()
+
+    cols_to_drop = [
+        "ArchiveType","OrganizationType","NoticeId","AdditionalInfoLink",
+        "Award$","Awardee","AwardNumber",
+        "PopCity","PopCountry","PopState","PopStreetAddress","PopZip",
+        "PrimaryContactFax","PrimaryContactTitle","SecondaryContactFax","SecondaryContactTitle",
+        "SetASide","SetASideCode",
+        "CGAC","FPDS Code","AAC Code","ZipCode","CountryCode","Type",
+        "BaseType","Office","Department/Ind.Agency","ArchiveDate"
+    ]
+    before_cols = len(df_recent.columns)
+    df_recent = df_recent.drop(columns=cols_to_drop, errors="ignore")
+    print("Recent rows:", len(df_recent), "| cols before:", before_cols, "| cols after:", len(df_recent.columns))
+
+except Exception as e:
+    safe_print_exception("Load SAM", e)
+    df_full = pd.DataFrame()
+    df_recent = pd.DataFrame()
 
 
-# =====================
-# STEP 4: FIND NEW OPEN BIDS NOT IN MASTER
-# =====================
-print("=== STEP 4: FIND NEW OPEN BIDS ===")
-df3_open = df3.loc[df3["AwardDate"].isna()].copy()
-df3_open["Sol#"] = df3_open["Sol#"].astype(str)
-print("Open rows in SAM (AwardDate empty):", len(df3_open))
+# =========================================================
+# STEP 3: CLOSED FROM PREV OPEN (USE FULL SAM)
+# =========================================================
 
-open_sol = set()
-if (not main_up.empty) and ("Sol#" in main_up.columns) and ("status" in main_up.columns):
-    open_sol = set(
-        main_up.loc[main_up["status"].eq("open"), "Sol#"]
-        .dropna()
-        .astype(str)
-        .unique()
-    )
-print("Open Sol# in master:", len(open_sol))
+print("=== STEP 3: CLOSED FROM PREV OPEN (FULL SAM) ===")
 
-main_up3 = df3_open.loc[~df3_open["Sol#"].isin(open_sol)].copy()
-print("New open rows not in master:", len(main_up3))
+closed_out_df = pd.DataFrame(columns=["Sol#", "close_reason", "AwardDate"])
 
-front_cols = ["Sol#", "PostedDate", "ResponseDeadLine"]
-front = [c for c in front_cols if c in main_up3.columns]
-rest = [c for c in main_up3.columns if c not in front]
-main_up4 = main_up3.loc[:, front + rest].copy()
+try:
+    if df_full.empty:
+        raise RuntimeError("SAM full df empty")
 
-main_up4["PostedDate"] = pd.to_datetime(main_up4["PostedDate"], errors="coerce", utc=True)
-main_up4 = main_up4.sort_values("PostedDate", ascending=False)
-main_up6 = main_up4.drop_duplicates(subset=["Sol#"], keep="first").copy()
-print("New unique Sol# to process:", len(main_up6))
+    if "AwardDate" in df_full.columns:
+        open_today_set = set(df_full.loc[df_full["AwardDate"].isna(), "Sol#"].dropna().astype(str).unique())
+    else:
+        open_today_set = set(df_full["Sol#"].dropna().astype(str).unique())
 
-main_up6["PostedDate"] = main_up6["PostedDate"].astype(str).str[:10]
-if "ResponseDeadLine" in main_up6.columns:
-    main_up6["ResponseDeadLine"] = main_up6["ResponseDeadLine"].astype(str).str[:10]
+    awarded_set = set()
+    award_map = {}
+    if "AwardDate" in df_full.columns:
+        awarded_rows = df_full.loc[df_full["AwardDate"].notna(), ["Sol#", "AwardDate"]].copy()
+        awarded_rows["AwardDate"] = awarded_rows["AwardDate"].astype(str).str[:10]
+        awarded_set = set(awarded_rows["Sol#"].astype(str))
+        award_map = dict(zip(awarded_rows["Sol#"].astype(str), awarded_rows["AwardDate"]))
 
-if len(main_up6) == 0:
-    print("No new records. Downstream GPT work should skip.")
+        closed_awarded = sorted(list(prev_open_set.intersection(awarded_set)))
+        
+        rows = []
+        for sol in closed_awarded:
+            rows.append({
+                "Sol#": sol,
+                "close_reason": "awarded",
+                "AwardDate": award_map.get(sol, "")
+            })
+        
+        closed_out_df = pd.DataFrame(rows)
+
+    print("Prev open:", len(prev_open_set), "| Open today:", len(open_today_set), "| Closed:", len(closed_out_df))
+
+except Exception as e:
+    safe_print_exception("Closed detection", e)
+    closed_out_df = pd.DataFrame(columns=["Sol#", "close_reason", "AwardDate"])
 
 
-# =====================
-# STEP 5: CLEAN PHONES, EMAILS
-# =====================
+# =========================================================
+# STEP 4: NEW OPEN TO ENRICH (USE RECENT ONLY)
+# =========================================================
+
+print("=== STEP 4: NEW OPEN TO ENRICH (RECENT ONLY) ===")
+
+DEBUG_STEP4 = True
+
+main_up6 = pd.DataFrame()
+
+try:
+    if df_recent.empty:
+        raise RuntimeError("SAM recent df empty")
+
+    # Normalize Sol#
+    df_recent["Sol#"] = df_recent["Sol#"].apply(norm_sol)
+
+    # Open rows
+    if "AwardDate" in df_recent.columns:
+        df_open_recent = df_recent.loc[df_recent["AwardDate"].isna()].copy()
+    else:
+        df_open_recent = df_recent.copy()
+
+    df_open_recent = df_open_recent.dropna(subset=["Sol#"]).copy()
+    df_open_recent = df_open_recent.loc[df_open_recent["Sol#"] != ""].copy()
+
+    # Debug inputs
+    if DEBUG_STEP4:
+        print("Step4 df_recent rows:", len(df_recent), "cols:", len(df_recent.columns))
+        print("Step4 df_open_recent rows:", len(df_open_recent), "cols:", len(df_open_recent.columns))
+        print("Step4 prev_open_set size:", len(prev_open_set))
+        print("Step4 df_open_recent Sol# sample:", df_open_recent["Sol#"].head(5).tolist())
+        print("Step4 prev_open sample:", list(sorted(list(prev_open_set)))[:5])
+
+    # Correct boolean mask
+    is_prev = df_open_recent["Sol#"].isin(prev_open_set)
+    is_new = ~is_prev
+
+    if DEBUG_STEP4:
+        print("Step4 is_prev type:", type(is_prev), "len:", len(is_prev))
+        print("Step4 is_new  type:", type(is_new), "len:", len(is_new))
+        print("Step4 counts prev:", int(is_prev.sum()), "new:", int(is_new.sum()))
+        print("Step4 mask sample (prev,new):", list(zip(is_prev.head(10).tolist(), is_new.head(10).tolist())))
+
+    new_open_df = df_open_recent.loc[is_new].copy()
+    print("New open rows (recent):", len(new_open_df))
+
+    # Sort for newest first
+    if ("PostedDate" in new_open_df.columns) and (len(new_open_df) > 0):
+        new_open_df["PostedDate"] = pd.to_datetime(new_open_df["PostedDate"], errors="coerce", utc=True)
+        new_open_df = new_open_df.sort_values("PostedDate", ascending=False)
+
+    # Unique Sol#
+    before_dups = len(new_open_df)
+    new_open_df = new_open_df.drop_duplicates(subset=["Sol#"], keep="first").copy()
+    print("New open unique Sol# (recent):", len(new_open_df), "dropped:", before_dups - len(new_open_df))
+
+    # Reorder columns
+    front_cols = ["Sol#", "PostedDate", "ResponseDeadLine"]
+    front = [c for c in front_cols if c in new_open_df.columns]
+
+    rest = []
+    for c in new_open_df.columns:
+        if c in front:
+            continue
+        rest.append(c)
+
+    main_up6 = new_open_df.loc[:, front + rest].copy()
+
+    # Normalize date strings
+    if "PostedDate" in main_up6.columns:
+        main_up6["PostedDate"] = pd.to_datetime(main_up6["PostedDate"], errors="coerce", utc=True).astype(str).str[:10]
+    if "ResponseDeadLine" in main_up6.columns:
+        main_up6["ResponseDeadLine"] = main_up6["ResponseDeadLine"].astype(str).str[:10]
+
+    if DEBUG_STEP4:
+        print("Step4 main_up6 rows:", len(main_up6))
+        print("Step4 main_up6 cols:", main_up6.columns.tolist())
+
+except Exception as e:
+    safe_print_exception("New-open detection", e)
+    main_up6 = pd.DataFrame()
+
+
+
+# =========================================================
+# STEP 5: CLEAN CONTACT FIELDS
+# =========================================================
+
 print("=== STEP 5: CLEAN CONTACT FIELDS ===")
+
 def clean_number(num):
     if pd.isna(num):
         return None
@@ -395,27 +767,6 @@ def clean_number(num):
         digits = digits[-10:]
         return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
     return None
-
-df5 = main_up6.copy()
-print("Rows entering contact cleanup:", len(df5))
-
-if "PrimaryContactPhone" in df5.columns:
-    df5["primary_phone_clean"] = df5["PrimaryContactPhone"].apply(clean_number)
-else:
-    df5["primary_phone_clean"] = None
-
-if "SecondaryContactPhone" in df5.columns:
-    df5["secondary_phone_clean"] = df5["SecondaryContactPhone"].apply(clean_number)
-else:
-    df5["secondary_phone_clean"] = None
-
-df5["phone_numbers"] = (
-    df5[["primary_phone_clean", "secondary_phone_clean"]]
-    .apply(lambda x: ", ".join([v for v in x if pd.notna(v)]), axis=1)
-    .replace("", None)
-)
-df5["phone_numbers"] = df5["phone_numbers"].apply(lambda x: None if x == "(000) 000-0000" else x)
-df5 = df5.drop(columns=["primary_phone_clean", "secondary_phone_clean"], errors="ignore")
 
 def clean_emails(*vals):
     emails = []
@@ -432,351 +783,330 @@ def clean_emails(*vals):
         if e in seen:
             continue
         seen.append(e)
-    return ";".join(seen) if seen else None
+    return ";".join(seen) if len(seen) > 0 else None
 
-p_email = "PrimaryContactEmail" if "PrimaryContactEmail" in df5.columns else None
-s_email = "SecondaryContactEmail" if "SecondaryContactEmail" in df5.columns else None
+df5 = pd.DataFrame()
+try:
+    df5 = main_up6.copy()
+    print("Rows entering cleanup:", len(df5))
+    if df5.empty:
+        raise RuntimeError("No new open rows")
 
-def _row_emails(r):
-    vals = []
-    if p_email:
-        vals.append(r.get(p_email))
-    if s_email:
-        vals.append(r.get(s_email))
-    return clean_emails(*vals)
+    if "PrimaryContactPhone" in df5.columns:
+        df5["primary_phone_clean"] = df5["PrimaryContactPhone"].apply(clean_number)
+    else:
+        df5["primary_phone_clean"] = None
 
-df5["contact_emails"] = df5.apply(_row_emails, axis=1)
+    if "SecondaryContactPhone" in df5.columns:
+        df5["secondary_phone_clean"] = df5["SecondaryContactPhone"].apply(clean_number)
+    else:
+        df5["secondary_phone_clean"] = None
 
-if "State" in df5.columns:
-    df5["State"] = (
-        df5["State"].astype(str).str.strip()
-        .replace({"": None, "nan": None, "None": None})
-        .fillna("NY")
+    def join_phones(r):
+        vals = []
+        a = r.get("primary_phone_clean")
+        b = r.get("secondary_phone_clean")
+        if pd.notna(a):
+            vals.append(a)
+        if pd.notna(b):
+            vals.append(b)
+        s = ", ".join(vals)
+        if s == "":
+            return None
+        if s == "(000) 000-0000":
+            return None
+        return s
+
+    df5["phone_numbers"] = df5.apply(join_phones, axis=1)
+    df5 = df5.drop(columns=["primary_phone_clean", "secondary_phone_clean"], errors="ignore")
+
+    p_email = "PrimaryContactEmail" if "PrimaryContactEmail" in df5.columns else None
+    s_email = "SecondaryContactEmail" if "SecondaryContactEmail" in df5.columns else None
+
+    def _row_emails(r):
+        vals = []
+        if p_email is not None:
+            vals.append(r.get(p_email))
+        if s_email is not None:
+            vals.append(r.get(s_email))
+        return clean_emails(*vals)
+
+    df5["contact_emails"] = df5.apply(_row_emails, axis=1)
+
+    if "State" in df5.columns:
+        df5["State"] = (
+            df5["State"].astype(str).str.strip()
+            .replace({"": None, "nan": None, "None": None})
+            .fillna("NY")
+        )
+    else:
+        df5["State"] = "NY"
+
+    df5 = df5.drop(
+        columns=[
+            "PrimaryContactFullname","PrimaryContactEmail","PrimaryContactPhone",
+            "SecondaryContactFullname","SecondaryContactEmail","SecondaryContactPhone",
+        ],
+        errors="ignore",
     )
-else:
-    df5["State"] = "NY"
 
-df5 = df5.drop(
-    columns=[
-        "PrimaryContactFullname",
-        "PrimaryContactEmail",
-        "PrimaryContactPhone",
-        "SecondaryContactFullname",
-        "SecondaryContactEmail",
-        "SecondaryContactPhone",
-    ],
-    errors="ignore",
-)
-print("Rows after contact cleanup:", len(df5))
+    print("Rows after cleanup:", len(df5))
+
+except Exception as e:
+    safe_print_exception("Contact cleanup", e)
+    df5 = main_up6.copy() if isinstance(main_up6, pd.DataFrame) else pd.DataFrame()
 
 
-# =====================
-# STEP 6: ENRICH NAICS + PSC FROM YOUR GITHUB FILES
-# =====================
-print("=== STEP 6: MERGE NAICS + PSC LOOKUPS ===")
-naics = pd.read_csv(
-    "https://raw.githubusercontent.com/bluesammer/tenders_codes/main/6-digit_2022_Codes.xlsx%20-%202022_6-digit_industries.csv"
-)
-naics["NaicsCode"] = pd.to_numeric(naics["2022 NAICS Code"], errors="coerce").astype("Int64")
-naics_first = naics[["NaicsCode", "2022 NAICS Title"]].drop_duplicates(subset=["NaicsCode"], keep="first")
-print("NAICS lookup rows:", len(naics_first))
+# =========================================================
+# STEP 6: NAICS + PSC LOOKUPS
+# =========================================================
 
-df6 = df5.merge(naics_first, on="NaicsCode", how="left")
+print("=== STEP 6: NAICS + PSC LOOKUPS ===")
+df7 = pd.DataFrame()
 
-code_PSC = pd.read_csv(
-    "https://raw.githubusercontent.com/bluesammer/tenders_codes/main/PSC%20April%202025.xlsx%20-%20PSC%20for%20042025.csv"
-)
-code_PSC_first = code_PSC.drop_duplicates(subset=["PSC CODE"], keep="first")
-print("PSC lookup rows:", len(code_PSC_first))
+try:
+    df7 = df5.copy()
+    if df7.empty:
+        raise RuntimeError("No new open rows")
 
-df7 = df6.merge(
-    code_PSC_first[["PSC CODE", "PRODUCT AND SERVICE CODE NAME"]],
-    left_on="ClassificationCode",
-    right_on="PSC CODE",
-    how="left",
-)
-print("Rows after NAICS+PSC merge:", len(df7))
+    naics = pd.read_csv(
+        "https://raw.githubusercontent.com/bluesammer/tenders_codes/main/6-digit_2022_Codes.xlsx%20-%202022_6-digit_industries.csv"
+    )
+    naics["NaicsCode"] = pd.to_numeric(naics["2022 NAICS Code"], errors="coerce").astype("Int64")
+    naics_first = naics[["NaicsCode", "2022 NAICS Title"]].drop_duplicates(subset=["NaicsCode"], keep="first")
+    df7 = df7.merge(naics_first, on="NaicsCode", how="left")
+
+    code_PSC = pd.read_csv(
+        "https://raw.githubusercontent.com/bluesammer/tenders_codes/main/PSC%20April%202025.xlsx%20-%20PSC%20for%20042025.csv"
+    )
+    code_PSC_first = code_PSC.drop_duplicates(subset=["PSC CODE"], keep="first")
+    df7 = df7.merge(
+        code_PSC_first[["PSC CODE", "PRODUCT AND SERVICE CODE NAME"]],
+        left_on="ClassificationCode",
+        right_on="PSC CODE",
+        how="left",
+    )
+
+    print("Rows after lookups:", len(df7))
+
+except Exception as e:
+    safe_print_exception("NAICS+PSC merge", e)
+    df7 = df5.copy() if isinstance(df5, pd.DataFrame) else pd.DataFrame()
 
 
-# =====================
+# =========================================================
 # STEP 7: DEFAULTS
-# =====================
+# =========================================================
+
 print("=== STEP 7: DEFAULTS ===")
-df7["status"] = "open"
-df7["last_update"] = date.today().isoformat()
+if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
+    df7["status"] = "open"
+    df7["last_update"] = date.today().isoformat()
+else:
+    print("No new open rows, defaults skipped")
 
 
-# =====================
-# STEP 8: GPT SUMMARY ENRICH
-# =====================
-print("=== STEP 8: GPT SUMMARY ===")
+# =========================================================
+# STEP 8: GPT SUMMARY ONLY
+# STEP 9: LOCAL CATEGORY (8)
+# =========================================================
+
+print("=== STEP 8: GPT SUMMARY ONLY + STEP 9: LOCAL CATEGORY (8) ===")
+
 TITLE_COL = "Title"
 DESC_COL = "Description"
-MODEL = "gpt-4o-mini"
-
-RUN_FULL = True
-TEST_ROWS = 5
-RANDOM_SAMPLE = False
-RANDOM_SEED = 42
-
-SKIP_IF_ALREADY_ENRICHED = True
-
-def row_already_enriched(df_: pd.DataFrame, i: int) -> bool:
-    s = str(df_.at[i, "summary_1_sentence"]).strip()
-    if s == "":
-        return False
-    if s.startswith("ERROR:"):
-        return False
-    return True
-
-def validate_summary(summary: str) -> str:
-    s = re.sub(r"\s+", " ", str(summary)).strip()
-    if len(s) > 260:
-        s = s[:260].rstrip()
-    if "." in s:
-        first = s.split(".", 1)[0].strip()
-        if first:
-            s = first + "."
-    return s
-
-def enrich_one(client: OpenAI, title: str, desc: str) -> dict:
-    prompt = (
-        "Return one JSON object only.\n"
-        "Keys must be exactly: summary_1_sentence.\n\n"
-        "summary_1_sentence rules:\n"
-        "One sentence.\n"
-        "Start with Provide or Deliver or Install or Maintain or Supply.\n"
-        "Describe what is being purchased.\n"
-        "Avoid procurement language.\n"
-        "Do not mention RFQ, solicitation, BPA, BAA, FAR, DFARS, amendments, deadlines, NAICS, set-aside.\n\n"
-        f"Title: {title}\n"
-        f"Description: {desc}\n"
-    )
-    resp = client.responses.create(
-        model=MODEL,
-        input=prompt,
-        text={"format": {"type": "json_object"}},
-    )
-    return json.loads(resp.output_text)
-
-if "summary_1_sentence" not in df7.columns:
-    df7["summary_1_sentence"] = ""
-
-need_summary = (df7["summary_1_sentence"].astype(str).str.strip() == "").sum()
-print("Rows needing GPT summary:", int(need_summary), "| total rows:", len(df7))
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-idxs = list(df7.index) if RUN_FULL else df7.head(TEST_ROWS).index.tolist()
-if RANDOM_SAMPLE and (not RUN_FULL):
-    random.seed(RANDOM_SEED)
-    idxs = random.sample(list(df7.index), min(TEST_ROWS, len(df7.index)))
-
-processed = 0
-skipped = 0
-
-start_summary = time.time()
-for i in idxs:
-    if SKIP_IF_ALREADY_ENRICHED and row_already_enriched(df7, i):
-        skipped += 1
-        continue
-
-    title = clean_text(df7.at[i, TITLE_COL], 800) if TITLE_COL in df7.columns else ""
-    desc = clean_text(df7.at[i, DESC_COL], 4000) if DESC_COL in df7.columns else ""
-
-    try:
-        raw = enrich_one(client, title, desc)
-        df7.at[i, "summary_1_sentence"] = validate_summary(raw.get("summary_1_sentence", ""))
-        processed += 1
-    except Exception as e:
-        df7.at[i, "summary_1_sentence"] = f"ERROR: {type(e).__name__}: {e}"
-        processed += 1
-
-elapsed_summary = time.time() - start_summary
-rate_summary = processed / elapsed_summary if elapsed_summary > 0 else 0
-print("Summary enrich done. processed:", processed, "skipped:", skipped, "rate:", f"{rate_summary:.2f}/sec")
-
-
-# =====================
-# STEP 9: GPT CATEGORY_20 ENFORCED BY MASTER LIST
-# =====================
-print("=== STEP 9: GPT CATEGORY_20 ===")
-OUT_COL = "category_20"
-COL_SUMMARY = "summary_1_sentence"
+OUT_SUM = "summary_1_sentence"
+OUT_CAT = "category_20"
 COL_NAICS = "2022 NAICS Title"
 COL_PSC = "PRODUCT AND SERVICE CODE NAME"
 
-def build_categories(master_df: pd.DataFrame):
-    if master_df.empty or "category_20" not in master_df.columns:
-        return []
-    cats = (
-        master_df["category_20"]
-        .dropna()
-        .astype(str)
-        .map(lambda x: x.strip())
-    )
-    cats = sorted(set([c for c in cats if c]))
-    return cats
-
-def row_needs_gpt(df_: pd.DataFrame, i: int, categories):
-    v = df_.at[i, OUT_COL] if OUT_COL in df_.columns else None
-    if v is None or pd.isna(v) or str(v).strip() == "":
-        return True
-    if str(v).strip() not in categories:
+def row_has_summary(df_: pd.DataFrame, i: int) -> bool:
+    if OUT_SUM in df_.columns:
+        s = str(df_.at[i, OUT_SUM]).strip()
+        if s == "":
+            return False
+        if s.startswith("ERROR:"):
+            return False
         return True
     return False
 
-def validate_category(choice, categories):
-    c = str(choice).strip()
-    if c in categories:
-        return c
-    lower_map = {x.lower(): x for x in categories}
-    if c.lower() in lower_map:
-        return lower_map[c.lower()]
-    return None
+gpt_stop_flag = False
 
-def classify_one(client_: OpenAI, categories, summary, naics, psc):
-    prompt = (
-        "Return one JSON object.\n"
-        "Key must be category_20.\n"
-        "Pick EXACTLY one value from this list:\n"
-        f"{categories}\n\n"
-        f"summary: {summary}\n"
-        f"naics: {naics}\n"
-        f"psc: {psc}"
-    )
-    resp = client_.responses.create(
-        model=MODEL,
-        input=prompt,
-        text={"format": {"type": "json_object"}}
-    )
-    return json.loads(resp.output_text)
+if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
 
-def classify_one_retry(client_: OpenAI, categories, summary, naics, psc):
-    prompt = (
-        "You MUST choose exactly one category from this list.\n"
-        "Return JSON only.\n"
-        f"{categories}\n\n"
-        f"summary: {summary}\n"
-        f"naics: {naics}\n"
-        f"psc: {psc}"
-    )
-    resp = client_.responses.create(
-        model=MODEL,
-        input=prompt,
-        text={"format": {"type": "json_object"}}
-    )
-    return json.loads(resp.output_text)
+    if OUT_SUM not in df7.columns:
+        df7[OUT_SUM] = ""
+    if OUT_CAT not in df7.columns:
+        df7[OUT_CAT] = ""
 
-categories = build_categories(main_up)
-print("Category list size:", len(categories))
+    # Step 8 summary
+    if DISABLE_GPT is True:
+        print("GPT disabled. Using fallback summaries.")
+        for i in df7.index.tolist():
+            if row_has_summary(df7, i):
+                continue
+            title = clean_text(df7.at[i, TITLE_COL], 500) if TITLE_COL in df7.columns else ""
+            desc = clean_text(df7.at[i, DESC_COL], 1600) if DESC_COL in df7.columns else ""
+            df7.at[i, OUT_SUM] = fallback_summary(title, desc)
+    else:
+        eligible_idxs = []
+        for i in df7.index.tolist():
+            if SKIP_IF_ALREADY_ENRICHED and row_has_summary(df7, i):
+                continue
+            eligible_idxs.append(i)
 
-if len(categories) == 0:
-    print("category_20 list missing in master. Skipping category_20 GPT step.")
+        if RANDOM_SAMPLE is True:
+            random.seed(RANDOM_SEED)
+            random.shuffle(eligible_idxs)
+
+        eligible_idxs = eligible_idxs[:MAX_GPT_ROWS_TOTAL]
+        print("Eligible summary rows:", len(eligible_idxs), "| MAX_GPT_ROWS_TOTAL:", MAX_GPT_ROWS_TOTAL, "| GPT_BATCH_SIZE:", GPT_BATCH_SIZE)
+
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        batches = chunk_list(eligible_idxs, GPT_BATCH_SIZE)
+
+        processed_rows = 0
+        start_t = time.time()
+
+        for b_ix, batch in enumerate(batches, start=1):
+            if gpt_stop_flag is True:
+                break
+
+            records = []
+            for i in batch:
+                sol = norm_sol(df7.at[i, "Sol#"]) if "Sol#" in df7.columns else ""
+                title = clean_text(df7.at[i, TITLE_COL], 500) if TITLE_COL in df7.columns else ""
+                desc = clean_text(df7.at[i, DESC_COL], 1600) if DESC_COL in df7.columns else ""
+                naics_v = clean_text(df7.at[i, COL_NAICS], 180) if COL_NAICS in df7.columns else ""
+                psc_v = clean_text(df7.at[i, COL_PSC], 180) if COL_PSC in df7.columns else ""
+
+                records.append({
+                    "Sol#": sol,
+                    "Title": title,
+                    "Description": desc,
+                    "naics": naics_v,
+                    "psc": psc_v,
+                })
+
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    out_map = gpt_summary_batch(client, records)
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    is_429 = ("429" in msg) or ("rate_limit" in msg.lower())
+                    if is_429 is True:
+                        wait_s = detect_retry_after_seconds(e)
+                        print(f"[WARN] 429 rate limit. sleep {wait_s:.1f}s. attempt {attempt}/{MAX_RETRIES_429}")
+                        time.sleep(wait_s)
+                        if attempt >= MAX_RETRIES_429:
+                            print("[WARN] 429 persisted. stopping GPT for this run.")
+                            if STOP_GPT_ON_RPD_LIMIT is True:
+                                gpt_stop_flag = True
+                                out_map = {}
+                                break
+                    else:
+                        safe_print_exception("GPT summary batch", e)
+                        out_map = {}
+                        break
+
+            for i in batch:
+                sol = norm_sol(df7.at[i, "Sol#"]) if "Sol#" in df7.columns else ""
+                if sol in out_map:
+                    df7.at[i, OUT_SUM] = out_map[sol]
+                else:
+                    title = clean_text(df7.at[i, TITLE_COL], 500) if TITLE_COL in df7.columns else ""
+                    desc = clean_text(df7.at[i, DESC_COL], 1600) if DESC_COL in df7.columns else ""
+                    df7.at[i, OUT_SUM] = fallback_summary(title, desc)
+
+            processed_rows += len(batch)
+
+            elapsed = time.time() - start_t
+            rps = processed_rows / elapsed if elapsed > 0 else 0.0
+            if (b_ix % PRINT_EVERY_BATCH) == 0:
+                print(f"Batch {b_ix}/{len(batches)} done. rows {processed_rows}/{len(eligible_idxs)} rate {rps:.2f} rows/sec")
+
+            if SLEEP_BETWEEN_BATCH_SEC > 0:
+                time.sleep(SLEEP_BETWEEN_BATCH_SEC)
+
+        print("GPT summary finished. rows processed:", processed_rows, "gpt_stop_flag:", gpt_stop_flag)
+
+    # Step 9 category local
+    if "PSC CODE" not in df7.columns:
+        if "ClassificationCode" in df7.columns:
+            df7["PSC CODE"] = df7["ClassificationCode"].astype(str)
+        else:
+            df7["PSC CODE"] = ""
+
+    if "PRODUCT AND SERVICE CODE NAME" not in df7.columns:
+        df7["PRODUCT AND SERVICE CODE NAME"] = ""
+
+    if "2022 NAICS Title" not in df7.columns:
+        df7["2022 NAICS Title"] = ""
+
+    df7[OUT_CAT] = df7.apply(map_category_8_local, axis=1)
+
 else:
-    if OUT_COL not in df7.columns:
-        df7[OUT_COL] = ""
-
-    need_cat = 0
-    for i in df7.index:
-        if row_needs_gpt(df7, i, categories):
-            need_cat += 1
-    print("Rows needing category_20 GPT:", need_cat, "| total rows:", len(df7))
-
-    client.responses.create(model=MODEL, input="ping")
-
-    processed = 0
-    errors = 0
-    start = time.time()
-
-    for i in df7.index:
-        if not row_needs_gpt(df7, i, categories):
-            continue
-
-        summary = clean_text(df7.at[i, COL_SUMMARY], 900)
-        naics_v = clean_text(df7.at[i, COL_NAICS], 240) if COL_NAICS in df7.columns else ""
-        psc_v = clean_text(df7.at[i, COL_PSC], 240) if COL_PSC in df7.columns else ""
-
-        try:
-            raw = classify_one(client, categories, summary, naics_v, psc_v)
-            choice = raw.get("category_20", "")
-            final = validate_category(choice, categories)
-
-            if final is None:
-                raw = classify_one_retry(client, categories, summary, naics_v, psc_v)
-                choice = raw.get("category_20", "")
-                final = validate_category(choice, categories)
-
-            if final is None:
-                df7.at[i, OUT_COL] = "ERROR"
-                errors += 1
-            else:
-                df7.at[i, OUT_COL] = final
-
-            processed += 1
-
-        except Exception as e:
-            df7.at[i, OUT_COL] = f"ERROR: {e}"
-            processed += 1
-            errors += 1
-
-        if processed % 25 == 0:
-            elapsed = time.time() - start
-            rate = processed / elapsed if elapsed > 0 else 0
-            print("Processed", processed, "| Errors", errors, "| Rate", f"{rate:.2f}/sec")
-
-    elapsed = time.time() - start
-    rate = processed / elapsed if elapsed > 0 else 0
-    print("category_20 done. processed:", processed, "errors:", errors, "rate:", f"{rate:.2f}/sec")
+    print("No new open rows, summary skipped, category skipped")
 
 
-# =====================
-# STEP 10: ALIGN COLUMNS, APPEND
-# =====================
-print("=== STEP 10: ALIGN + APPEND ===")
-if main_up.empty:
-    print("Master empty. Setting master = df7 (no append).")
-    main_up = df7.copy()
-else:
-    missing_in_df7 = set(main_up.columns) - set(df7.columns)
-    extra_in_df7 = set(df7.columns) - set(main_up.columns)
+# =========================================================
+# STEP 10: WRITE OUTPUT FILES
+# =========================================================
 
-    print("Columns in master:", len(main_up.columns))
-    print("Columns in df7:", len(df7.columns))
-    print("Missing cols to add to df7:", len(missing_in_df7))
-    print("Extra cols to drop from df7:", len(extra_in_df7))
+print("=== STEP 10: WRITE OUTPUT FILES ===")
 
-    for col in missing_in_df7:
-        df7[col] = pd.NA
+try:
+    closed_out_df.to_csv(CLOSED_OUT_PATH, index=False)
+    print("Wrote closed file:", str(CLOSED_OUT_PATH), "| rows:", len(closed_out_df))
+except Exception as e:
+    safe_print_exception("Write closed file", e)
 
-    df7 = df7.drop(columns=list(extra_in_df7), errors="ignore")
-    df7 = df7[main_up.columns]
+try:
+    if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
+        df7.to_csv(NEW_OPEN_OUT_PATH, index=False)
+        print("Wrote new enriched file:", str(NEW_OPEN_OUT_PATH), "| rows:", len(df7))
+    else:
+        pd.DataFrame().to_csv(NEW_OPEN_OUT_PATH, index=False)
+        print("Wrote empty new enriched file:", str(NEW_OPEN_OUT_PATH), "| rows: 0")
+except Exception as e:
+    safe_print_exception("Write new enriched file", e)
+
+
+# =========================================================
+# STEP 11: PUSH OUTPUTS (RAILWAY MODE)
+# =========================================================
+
+print("=== STEP 11: PUSH OUTPUTS (RAILWAY MODE) ===")
+if USE_RAILWAY_MODE:
+    try:
+        http_post_csv(CLOSED_OUT_ENDPOINT, RAILWAY_API_SECRET, closed_out_df, timeout=240)
+        print("Pushed closed file.")
+    except Exception as e:
+        safe_print_exception("Push closed file", e)
 
     try:
-        df7 = df7.astype(main_up.dtypes.to_dict(), errors="ignore")
+        df_to_push = df7 if isinstance(df7, pd.DataFrame) else pd.DataFrame()
+        http_post_csv(NEW_OPEN_OUT_ENDPOINT, RAILWAY_API_SECRET, df_to_push, timeout=240)
+        print("Pushed new enriched file.")
     except Exception as e:
-        print("Type alignment warning:", e)
+        safe_print_exception("Push new enriched file", e)
+else:
+    print("Local mode. Skipped pushes.")
 
-    rows_before = len(main_up)
-    main_up = pd.concat([main_up, df7], ignore_index=True)
-    rows_after = len(main_up)
-
-    print("Rows appended:", rows_after - rows_before)
-    print("New total rows:", rows_after)
+print("=== DONE ===")
 
 
-# =====================
-# STEP 11: SAVE LOCAL + PUSH MASTER VIA SECURE ENDPOINT
-# =====================
-print("=== STEP 11: SAVE + UPLOAD ===")
-main_up.to_csv(MASTER_LOCAL_PATH, index=False)
-print("Saved master locally:", str(MASTER_LOCAL_PATH))
-if MASTER_LOCAL_PATH.exists():
-    print("Local master size:", bytes_human(MASTER_LOCAL_PATH.stat().st_size))
+# In[ ]:
 
-mem_bytes = int(main_up.memory_usage(deep=True).sum())
-print("Master memory bytes:", bytes_human(mem_bytes))
 
-master_put_df(main_up)
-print("Master upload done:", MASTER_FEED_NAME)
+
+
+
+# In[ ]:
+
+
+
 
