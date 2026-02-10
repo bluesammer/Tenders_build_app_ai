@@ -19,4 +19,4 @@ COPY . /app
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
-CMD ["python", "main.py"]
+CMD ["python", "-u", "main.py"]
