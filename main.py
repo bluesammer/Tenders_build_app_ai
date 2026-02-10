@@ -73,7 +73,7 @@ MIN_SAM_BYTES_SKIP_DOWNLOAD = 150_000_000
 DISABLE_GPT = False
 
 # Reads Railway env var. Defaults to 500 if missing.
-MAX_GPT_ROWS_TOTAL = int(os.getenv("MAX_GPT_ROWS_TOTAL", "500"))
+MAX_GPT_ROWS_TOTAL = int(os.getenv("MAX_GPT_ROWS_TOTAL", "10"))
 
 GPT_BATCH_SIZE = 25
 MODEL = "gpt-4o-mini"
@@ -184,17 +184,34 @@ def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
         return pd.DataFrame()
     return read_csv_safely_text(resp.text)
 
-def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, filename: str, timeout: int = 240) -> None:
+def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, filename: str, timeout: int = 600) -> None:
+    allowed = {
+        "tenders_open_current.csv",
+        "tender_was_open_now_close_live.csv",
+        "tender_append_fresh_data.csv",
+    }
+    if filename not in allowed:
+        raise RuntimeError(f"Invalid upload filename: {filename}")
+
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     files = {"file": (filename, csv_bytes, "text/csv")}
-    resp = requests.post(
-        url,
-        headers={"x-railway-secret": secret},
-        files=files,
-        timeout=timeout,
-    )
-    if resp.status_code not in (200, 201, 204):
-        raise RuntimeError(f"POST failed {resp.status_code}: {resp.text[:500]}")
+
+    for attempt in [1, 2]:
+        try:
+            resp = requests.post(
+                url,
+                headers={"x-railway-secret": secret},
+                files=files,
+                timeout=timeout,
+            )
+            if resp.status_code in (200, 201, 204):
+                return
+            raise RuntimeError(f"POST failed {resp.status_code}: {resp.text[:500]}")
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise RuntimeError("POST timed out twice")
+            time.sleep(3)
+
 
 def load_previous_open_list() -> pd.DataFrame:
     if USE_RAILWAY_MODE:
@@ -1045,7 +1062,7 @@ except Exception as e:
 # STEP 11: PUSH OUTPUTS (RAILWAY MODE)
 # =========================================================
 
-print("=== STEP 11: PUSH OUTPUTS (RAILWAY MODE) ===")
+# STEP 11
 if USE_RAILWAY_MODE:
     try:
         http_post_csv_multipart(
@@ -1053,7 +1070,7 @@ if USE_RAILWAY_MODE:
             RAILWAY_API_SECRET,
             closed_out_df,
             CLOSED_REMOTE_FILENAME,
-            timeout=240
+            timeout=600
         )
         print("Pushed closed file.")
     except Exception as e:
@@ -1066,15 +1083,12 @@ if USE_RAILWAY_MODE:
             RAILWAY_API_SECRET,
             df_to_push,
             FRESH_REMOTE_FILENAME,
-            timeout=240
+            timeout=600
         )
         print("Pushed fresh file.")
     except Exception as e:
         safe_print_exception("Push fresh file", e)
-else:
-    print("Local mode. Skipped pushes.")
 
-print("=== DONE ===")
 
 
 # In[ ]:
