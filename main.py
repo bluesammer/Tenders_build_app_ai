@@ -80,6 +80,7 @@ USE_RAILWAY_MODE = True
 
 
 
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 # Railway secret only needed when USE_RAILWAY_MODE=True
@@ -96,6 +97,7 @@ DISABLE_GPT = False
 
 # Total GPT rows to process each run
 #MAX_GPT_ROWS_TOTAL = 10      have in railwasy BUT in local uncommen tthis
+MAX_GPT_ROWS_TOTAL = int(os.getenv("MAX_GPT_ROWS_TOTAL", "500"))
 
 # Batch size per GPT request
 GPT_BATCH_SIZE = 25
@@ -160,8 +162,8 @@ SAM_CSV_NAME = "ContractOpportunitiesFullCSV.csv"
 SAM_CSV_PATH = DOWNLOAD_DIR / SAM_CSV_NAME
 
 RUNSTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-CLOSED_OUT_PATH = DOWNLOAD_DIR / f"tenders_closed_from_open_{RUNSTAMP}.csv"
-NEW_OPEN_OUT_PATH = DOWNLOAD_DIR / f"tenders_new_open_enriched_{RUNSTAMP}.csv"
+CLOSED_OUT_PATH = DOWNLOAD_DIR / f"tenders_now_closed.csv"
+NEW_OPEN_OUT_PATH = DOWNLOAD_DIR / f"tenders_add_fresh.csv"
 
 
 # =========================================================
@@ -926,7 +928,7 @@ print("=== STEP 8: GPT SUMMARY ONLY + STEP 9: LOCAL CATEGORY (8) ===")
 TITLE_COL = "Title"
 DESC_COL = "Description"
 OUT_SUM = "summary_1_sentence"
-OUT_CAT = "category_20"
+OUT_CAT = "category_alarm_8_raw"
 COL_NAICS = "2022 NAICS Title"
 COL_PSC = "PRODUCT AND SERVICE CODE NAME"
 
