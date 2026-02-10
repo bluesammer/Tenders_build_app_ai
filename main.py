@@ -8,6 +8,9 @@
 # put-closed-sol-csv and put-new-open-enriched-csv, accept CSV upload and store it in Storage or load it into tables for your combine step
 # 
 # If you already have only one endpoint, tell me its name and I will align the script URLs and request headers to match it.
+# 3 files tenders_open_current = this is the master file
+# tender_was_open_now_close_live = tenders where the status was open in "tenders_open_current" but is now "closed"
+# tender_append_fresh_data = new tenders which are not in the tenders_open_current. yet
 # 
 
 # You want a single script with a top switch.
@@ -30,13 +33,18 @@
 # 
 # Below is a full drop-in script. Change only the CONFIG section.
 
-# In[3]:
+# In[4]:
 
 
 #!/usr/bin/env python
 # coding: utf-8   railway_local_combo_v3.ipynb
+
+
 #pull loveabl or local. dothe magic and dump back
 # https://github.com/...../Tenders_build_app_ai
+#eric add the import os  os.environ["OPENAI_API_KEY"] = "sk-proj-T to runlocally
+#MAX_GPT_ROWS_TOTAL = 10      have in railwasy BUT in local uncommen tthis see below
+
 import os
 import re
 import json
@@ -70,6 +78,8 @@ USE_RAILWAY_MODE = True
 #   setx OPENAI_API_KEY "sk-..."
 # Then restart terminal.
 
+
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 # Railway secret only needed when USE_RAILWAY_MODE=True
@@ -85,7 +95,7 @@ MIN_SAM_BYTES_SKIP_DOWNLOAD = 150_000_000
 DISABLE_GPT = False
 
 # Total GPT rows to process each run
-MAX_GPT_ROWS_TOTAL = 10
+#MAX_GPT_ROWS_TOTAL = 10      have in railwasy BUT in local uncommen tthis
 
 # Batch size per GPT request
 GPT_BATCH_SIZE = 25
@@ -1097,6 +1107,12 @@ else:
     print("Local mode. Skipped pushes.")
 
 print("=== DONE ===")
+
+
+# In[ ]:
+
+
+
 
 
 # In[ ]:
