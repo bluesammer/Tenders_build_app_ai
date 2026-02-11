@@ -37,7 +37,7 @@
 
 
 #!/usr/bin/env python
-# coding: utf-8   railway_local_combo_v3.ipynb
+# coding: utf-8
 
 import os
 import re
@@ -72,9 +72,7 @@ DOWNLOAD_SAM = True
 MIN_SAM_BYTES_SKIP_DOWNLOAD = 150_000_000
 DISABLE_GPT = False
 
-# Reads Railway env var. Defaults to 10 if missing.
 MAX_GPT_ROWS_TOTAL = int(os.getenv("MAX_GPT_ROWS_TOTAL", "10"))
-
 GPT_BATCH_SIZE = 25
 MODEL = "gpt-4o-mini"
 
@@ -89,7 +87,6 @@ SLEEP_BETWEEN_BATCH_SEC = 0.15
 
 STOP_GPT_ON_RPD_LIMIT = True
 
-# Optional: quick 504 isolation. Set TRUE to upload only 25 rows of fresh.
 UPLOAD_FRESH_LIMIT_25 = os.getenv("UPLOAD_FRESH_LIMIT_25", "false").strip().lower() in ("1", "true", "yes")
 
 CATEGORY_LIST = [
@@ -107,9 +104,10 @@ CATEGORY_LIST = [
 OPEN_LIST_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/get-railway-csv"
 UPLOAD_RESULTS_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/upload-railway-results"
 
-# Multipart filenames Lovable expects
+# Remote filenames Lovable expects
 CLOSED_REMOTE_FILENAME = "tender_was_open_now_close_live.csv"
 FRESH_REMOTE_FILENAME = "tender_append_fresh_data.csv"
+OPEN_REMOTE_FILENAME = "tenders_open_current.csv"
 
 # Local open list export (local mode only)
 LOCAL_OPEN_LIST_PATH = r"C:\Users\Blues\upwork\10000k_conrcats_merx_govt_contracts_USA 2026 -Better\downloads\maybe just swap with same name\tenders_open_current-export-2026-02-09_12-59-53.csv"
@@ -136,7 +134,7 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SAM_CSV_NAME = "ContractOpportunitiesFullCSV.csv"
 SAM_CSV_PATH = DOWNLOAD_DIR / SAM_CSV_NAME
 
-# Local disk filenames, no timestamps
+# Local disk outputs (filenames do not matter, remote filenames do)
 CLOSED_OUT_PATH = DOWNLOAD_DIR / "tenders_now_closed.csv"
 NEW_OPEN_OUT_PATH = DOWNLOAD_DIR / "tenders_add_fresh.csv"
 
@@ -187,29 +185,29 @@ def clean_text(x, limit: int) -> str:
 def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
     resp = requests.get(url, headers={"x-railway-secret": secret}, timeout=timeout)
     if resp.status_code != 200:
-        raise RuntimeError(f"GET failed {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"GET failed {resp.status_code}: {resp.text[:800]}")
     if resp.text.strip() == "":
         return pd.DataFrame()
     return read_csv_safely_text(resp.text)
 
 
-def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, filename: str, timeout: int = 600) -> None:
+def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, remote_filename: str, timeout: int = 600) -> None:
     allowed = {
         "tenders_open_current.csv",
         "tender_was_open_now_close_live.csv",
         "tender_append_fresh_data.csv",
     }
-    if filename not in allowed:
-        raise RuntimeError(f"Invalid upload filename: {filename}")
+    if remote_filename not in allowed:
+        raise RuntimeError(f"Invalid upload filename: {remote_filename}")
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
 
-    # IMPORTANT FIX:
-    # Supabase function expects the multipart FIELD NAME to match the filename.
-    # Example: files["tender_was_open_now_close_live.csv"] = (...)
-    files = {filename: (filename, csv_bytes, "text/csv")}
+    # IMPORTANT:
+    # Always use a stable multipart field name "file".
+    # Always force the remote filename via the tuple's first element.
+    files = {"file": (remote_filename, csv_bytes, "text/csv")}
 
-    for attempt in [1, 2]:
+    for attempt in [1, 2, 3]:
         try:
             resp = requests.post(
                 url,
@@ -218,12 +216,15 @@ def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, filename: s
                 timeout=timeout,
             )
             if resp.status_code in (200, 201, 204):
+                print("Upload OK:", remote_filename, "bytes:", len(csv_bytes))
                 return
-            raise RuntimeError(f"POST failed {resp.status_code}: {resp.text[:500]}")
+            raise RuntimeError(f"POST failed {resp.status_code}: {resp.text[:800]}")
         except requests.exceptions.Timeout:
-            if attempt == 2:
-                raise RuntimeError("POST timed out twice")
-            time.sleep(3)
+            if attempt == 3:
+                raise RuntimeError(f"POST timed out 3 times for {remote_filename}")
+            backoff = 2 * attempt
+            print("[WARN] Upload timeout. retry in", backoff, "sec. attempt", attempt, "/3. file:", remote_filename)
+            time.sleep(backoff)
 
 
 def load_previous_open_list() -> pd.DataFrame:
@@ -494,7 +495,7 @@ def gpt_summary_batch(client: OpenAI, records: list) -> dict:
 
 
 # =========================================================
-# STEP 0: LOAD PREVIOUS OPEN LIST
+# MAIN
 # =========================================================
 
 print("=== STEP 0: LOAD PREVIOUS OPEN LIST ===")
@@ -517,11 +518,6 @@ if USE_RAILWAY_MODE and (open_list_loaded_ok is False):
 prev_open_set = set(prev_open_df["Sol#"].dropna().astype(str))
 if "" in prev_open_set:
     prev_open_set.remove("")
-
-
-# =========================================================
-# STEP 1: SAM.GOV DOWNLOAD
-# =========================================================
 
 print("=== STEP 1: SAM.GOV DOWNLOAD ===")
 
@@ -607,11 +603,6 @@ print("SAM_CSV_PATH:", str(SAM_CSV_PATH), "| exists:", SAM_CSV_PATH.exists())
 if SAM_CSV_PATH.exists():
     print("SAM size:", bytes_human(SAM_CSV_PATH.stat().st_size))
 
-
-# =========================================================
-# STEP 2: LOAD SAM (FULL) + BUILD RECENT (6 MONTHS)
-# =========================================================
-
 print("=== STEP 2: LOAD SAM (FULL) + RECENT FILTER ===")
 
 df_full = pd.DataFrame()
@@ -655,11 +646,6 @@ except Exception as e:
     df_full = pd.DataFrame()
     df_recent = pd.DataFrame()
 
-
-# =========================================================
-# STEP 3: CLOSED FROM PREV OPEN (USE FULL SAM)
-# =========================================================
-
 print("=== STEP 3: CLOSED FROM PREV OPEN (FULL SAM) ===")
 
 closed_out_df = pd.DataFrame(columns=["Sol#", "close_reason", "AwardDate"])
@@ -668,13 +654,9 @@ try:
     if df_full.empty:
         raise RuntimeError("SAM full df empty")
 
-    if "AwardDate" in df_full.columns:
-        open_today_set = set(df_full.loc[df_full["AwardDate"].isna(), "Sol#"].dropna().astype(str).unique())
-    else:
-        open_today_set = set(df_full["Sol#"].dropna().astype(str).unique())
-
     awarded_set = set()
     award_map = {}
+
     if "AwardDate" in df_full.columns:
         awarded_rows = df_full.loc[df_full["AwardDate"].notna(), ["Sol#", "AwardDate"]].copy()
         awarded_rows["AwardDate"] = awarded_rows["AwardDate"].astype(str).str[:10]
@@ -693,22 +675,16 @@ try:
 
         closed_out_df = pd.DataFrame(rows)
 
-    print("Prev open:", len(prev_open_set), "| Open today:", len(open_today_set), "| Closed:", len(closed_out_df))
+    open_today_count = len(set(df_full["Sol#"].dropna().astype(str).unique()))
+    print("Prev open:", len(prev_open_set), "| Open today:", open_today_count, "| Closed:", len(closed_out_df))
 
 except Exception as e:
     safe_print_exception("Closed detection", e)
     closed_out_df = pd.DataFrame(columns=["Sol#", "close_reason", "AwardDate"])
 
-
-# =========================================================
-# STEP 4: NEW OPEN TO ENRICH (USE RECENT ONLY)
-# =========================================================
-
 print("=== STEP 4: NEW OPEN TO ENRICH (RECENT ONLY) ===")
 
-DEBUG_STEP4 = True
 main_up6 = pd.DataFrame()
-
 try:
     if df_recent.empty:
         raise RuntimeError("SAM recent df empty")
@@ -723,20 +699,8 @@ try:
     df_open_recent = df_open_recent.dropna(subset=["Sol#"]).copy()
     df_open_recent = df_open_recent.loc[df_open_recent["Sol#"] != ""].copy()
 
-    if DEBUG_STEP4:
-        print("Step4 df_recent rows:", len(df_recent), "cols:", len(df_recent.columns))
-        print("Step4 df_open_recent rows:", len(df_open_recent), "cols:", len(df_open_recent.columns))
-        print("Step4 prev_open_set size:", len(prev_open_set))
-        print("Step4 df_open_recent Sol# sample:", df_open_recent["Sol#"].head(5).tolist())
-        print("Step4 prev_open sample:", list(sorted(list(prev_open_set)))[:5])
-
     is_prev = df_open_recent["Sol#"].isin(prev_open_set)
-    is_new = ~is_prev
-
-    if DEBUG_STEP4:
-        print("Step4 counts prev:", int(is_prev.sum()), "new:", int(is_new.sum()))
-
-    new_open_df = df_open_recent.loc[is_new].copy()
+    new_open_df = df_open_recent.loc[~is_prev].copy()
     print("New open rows (recent):", len(new_open_df))
 
     if ("PostedDate" in new_open_df.columns) and (len(new_open_df) > 0):
@@ -757,17 +721,9 @@ try:
     if "ResponseDeadLine" in main_up6.columns:
         main_up6["ResponseDeadLine"] = main_up6["ResponseDeadLine"].astype(str).str[:10]
 
-    if DEBUG_STEP4:
-        print("Step4 main_up6 rows:", len(main_up6))
-
 except Exception as e:
     safe_print_exception("New-open detection", e)
     main_up6 = pd.DataFrame()
-
-
-# =========================================================
-# STEP 5: CLEAN CONTACT FIELDS
-# =========================================================
 
 print("=== STEP 5: CLEAN CONTACT FIELDS ===")
 
@@ -870,14 +826,9 @@ except Exception as e:
     safe_print_exception("Contact cleanup", e)
     df5 = main_up6.copy() if isinstance(main_up6, pd.DataFrame) else pd.DataFrame()
 
-
-# =========================================================
-# STEP 6: NAICS + PSC LOOKUPS
-# =========================================================
-
 print("=== STEP 6: NAICS + PSC LOOKUPS ===")
-df7 = pd.DataFrame()
 
+df7 = pd.DataFrame()
 try:
     df7 = df5.copy()
     if df7.empty:
@@ -907,22 +858,12 @@ except Exception as e:
     safe_print_exception("NAICS+PSC merge", e)
     df7 = df5.copy() if isinstance(df5, pd.DataFrame) else pd.DataFrame()
 
-
-# =========================================================
-# STEP 7: DEFAULTS
-# =========================================================
-
 print("=== STEP 7: DEFAULTS ===")
 if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
     df7["status"] = "open"
     df7["last_update"] = date.today().isoformat()
 else:
     print("No new open rows, defaults skipped")
-
-
-# =========================================================
-# STEP 8: GPT SUMMARY ONLY + STEP 9: LOCAL CATEGORY (8)
-# =========================================================
 
 print("=== STEP 8: GPT SUMMARY ONLY + STEP 9: LOCAL CATEGORY (8) ===")
 
@@ -1065,10 +1006,6 @@ else:
     print("No new open rows, summary skipped, category skipped")
 
 
-# =========================================================
-# STEP 10: WRITE OUTPUT FILES
-# =========================================================
-
 print("=== STEP 10: WRITE OUTPUT FILES ===")
 
 try:
@@ -1087,15 +1024,34 @@ try:
 except Exception as e:
     safe_print_exception("Write new enriched file", e)
 
-
-# =========================================================
-# STEP 11: PUSH OUTPUTS (RAILWAY MODE)
-# =========================================================
-
 print("=== STEP 11: PUSH OUTPUTS (RAILWAY MODE) ===")
+
+def reduce_fresh_payload(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    keep_cols = [
+        "Sol#", "PostedDate", "ResponseDeadLine",
+        "NaicsCode", "2022 NAICS Title",
+        "ClassificationCode", "PSC CODE", "PRODUCT AND SERVICE CODE NAME",
+        "summary_1_sentence", "category_alarm_8_raw",
+        "contact_emails", "phone_numbers", "State",
+        "status", "last_update",
+    ]
+    present = [c for c in keep_cols if c in df.columns]
+    slim = df[present].copy()
+
+    # Ensure no giant strings sneak in
+    for c in ["summary_1_sentence", "2022 NAICS Title", "PRODUCT AND SERVICE CODE NAME", "contact_emails"]:
+        if c in slim.columns:
+            slim[c] = slim[c].astype(str).apply(lambda x: clean_text(x, 260 if c == "summary_1_sentence" else 180))
+
+    return slim
+
 
 if USE_RAILWAY_MODE:
     try:
+        print("Upload closed remote:", CLOSED_REMOTE_FILENAME, "rows:", len(closed_out_df))
         http_post_csv_multipart(
             UPLOAD_RESULTS_ENDPOINT,
             RAILWAY_API_SECRET,
@@ -1108,11 +1064,16 @@ if USE_RAILWAY_MODE:
         safe_print_exception("Push closed file", e)
 
     try:
-        df_to_push = df7 if isinstance(df7, pd.DataFrame) else pd.DataFrame()
-        if UPLOAD_FRESH_LIMIT_25 and isinstance(df_to_push, pd.DataFrame) and (df_to_push.empty is False):
+        df_to_push = df7.copy() if isinstance(df7, pd.DataFrame) else pd.DataFrame()
+
+        # Shrink payload to avoid 504 timeouts
+        df_to_push = reduce_fresh_payload(df_to_push)
+
+        if UPLOAD_FRESH_LIMIT_25 and (df_to_push.empty is False):
             print("UPLOAD_FRESH_LIMIT_25 enabled. Uploading only first 25 rows for testing.")
             df_to_push = df_to_push.head(25).copy()
 
+        print("Upload fresh remote:", FRESH_REMOTE_FILENAME, "rows:", len(df_to_push), "cols:", len(df_to_push.columns))
         http_post_csv_multipart(
             UPLOAD_RESULTS_ENDPOINT,
             RAILWAY_API_SECRET,
