@@ -44,7 +44,7 @@ import re
 import json
 import time
 import random
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 from io import StringIO
 
@@ -72,7 +72,7 @@ DOWNLOAD_SAM = True
 MIN_SAM_BYTES_SKIP_DOWNLOAD = 150_000_000
 DISABLE_GPT = False
 
-# Reads Railway env var. Defaults to 500 if missing.
+# Reads Railway env var. Defaults to 10 if missing.
 MAX_GPT_ROWS_TOTAL = int(os.getenv("MAX_GPT_ROWS_TOTAL", "10"))
 
 GPT_BATCH_SIZE = 25
@@ -88,6 +88,9 @@ PRINT_EVERY_BATCH = 1
 SLEEP_BETWEEN_BATCH_SEC = 0.15
 
 STOP_GPT_ON_RPD_LIMIT = True
+
+# Optional: quick 504 isolation. Set TRUE to upload only 25 rows of fresh.
+UPLOAD_FRESH_LIMIT_25 = os.getenv("UPLOAD_FRESH_LIMIT_25", "false").strip().lower() in ("1", "true", "yes")
 
 CATEGORY_LIST = [
     "IT and Cyber",
@@ -151,8 +154,10 @@ def bytes_human(n: int) -> str:
         f /= 1024.0
     return f"{f:.1f}TB"
 
+
 def safe_print_exception(tag: str, e: Exception) -> None:
     print(f"[ERROR] {tag}: {type(e).__name__}: {e}")
+
 
 def read_csv_safely_path(p: Path) -> pd.DataFrame:
     encodings = ["utf-8", "cp1252", "latin1"]
@@ -163,8 +168,10 @@ def read_csv_safely_path(p: Path) -> pd.DataFrame:
             pass
     return pd.read_csv(p, encoding="utf-8", errors="replace", low_memory=False)
 
+
 def read_csv_safely_text(text: str) -> pd.DataFrame:
     return pd.read_csv(StringIO(text), low_memory=False)
+
 
 def clean_text(x, limit: int) -> str:
     if pd.isna(x):
@@ -176,6 +183,7 @@ def clean_text(x, limit: int) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:limit]
 
+
 def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
     resp = requests.get(url, headers={"x-railway-secret": secret}, timeout=timeout)
     if resp.status_code != 200:
@@ -183,6 +191,7 @@ def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
     if resp.text.strip() == "":
         return pd.DataFrame()
     return read_csv_safely_text(resp.text)
+
 
 def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, filename: str, timeout: int = 600) -> None:
     allowed = {
@@ -194,7 +203,11 @@ def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, filename: s
         raise RuntimeError(f"Invalid upload filename: {filename}")
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
-    files = {"file": (filename, csv_bytes, "text/csv")}
+
+    # IMPORTANT FIX:
+    # Supabase function expects the multipart FIELD NAME to match the filename.
+    # Example: files["tender_was_open_now_close_live.csv"] = (...)
+    files = {filename: (filename, csv_bytes, "text/csv")}
 
     for attempt in [1, 2]:
         try:
@@ -237,8 +250,10 @@ def load_previous_open_list() -> pd.DataFrame:
     out = out.dropna(subset=["Sol#"]).drop_duplicates(subset=["Sol#"], keep="first")
     return out
 
+
 CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium")
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+
 
 def build_driver(download_dir: Path) -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
@@ -266,6 +281,7 @@ def build_driver(download_dir: Path) -> webdriver.Chrome:
     options.add_argument("--start-maximized")
     return webdriver.Chrome(options=options)
 
+
 def wait_for_file_stable(path: Path, timeout_sec: int = 1200, stable_sec: int = 20, min_bytes: int = 50_000_000) -> None:
     start = time.time()
     last_size = -1
@@ -287,6 +303,7 @@ def wait_for_file_stable(path: Path, timeout_sec: int = 1200, stable_sec: int = 
 
     raise RuntimeError(f"Timeout waiting for stable file: {path}")
 
+
 def norm_sol(x) -> str:
     if pd.isna(x):
         return ""
@@ -299,6 +316,7 @@ def norm_sol(x) -> str:
     s = re.sub(r"[^A-Za-z0-9\-]", "", s)
     return s.upper().strip()
 
+
 def validate_summary(summary: str) -> str:
     s = re.sub(r"\s+", " ", str(summary)).strip()
     if len(s) > 260:
@@ -308,6 +326,7 @@ def validate_summary(summary: str) -> str:
         if first != "":
             s = first + "."
     return s
+
 
 def fallback_summary(title: str, desc: str) -> str:
     t = clean_text(title, 140)
@@ -321,6 +340,7 @@ def fallback_summary(title: str, desc: str) -> str:
         return validate_summary("Provide " + base)
     return "Provide requested goods or services."
 
+
 def chunk_list(items, chunk_size: int):
     out = []
     i = 0
@@ -328,6 +348,7 @@ def chunk_list(items, chunk_size: int):
         out.append(items[i:i + chunk_size])
         i += chunk_size
     return out
+
 
 def detect_retry_after_seconds(err: Exception) -> float:
     msg = str(err)
@@ -360,9 +381,11 @@ KW_IT_STRONG = re.compile(r"\b(cyber|infosec|\bsoc\b|siem|zero trust|firewall|vp
 KW_IT_MED = re.compile(r"\b(software|saas|cloud|azure|aws|gcp|kubernetes|devops|api|database|crm|erp|helpdesk|it support|endpoint|microsoft 365|\bo365\b)\b", re.I)
 KW_IT_WEAK = re.compile(r"\b(data|server|network)\b", re.I)
 
+
 def psc_prefix(x):
     s = str(x).strip().upper()
     return s[0] if len(s) > 0 else ""
+
 
 def text_blob_raw(r):
     parts = [
@@ -373,6 +396,7 @@ def text_blob_raw(r):
     ]
     return " ".join(parts).lower()
 
+
 def is_it(text):
     if KW_IT_STRONG.search(text):
         return True
@@ -382,8 +406,10 @@ def is_it(text):
         return True
     return False
 
+
 def is_cons(text):
     return bool(KW_CONS1.search(text) or KW_CONS2.search(text))
+
 
 def is_pro(text):
     return bool(
@@ -393,6 +419,7 @@ def is_pro(text):
         KW_PRO4.search(text) or
         KW_PRO5.search(text)
     )
+
 
 def map_category_8_local(row):
     p = psc_prefix(row.get("PSC CODE", ""))
@@ -484,7 +511,6 @@ except Exception as e:
     safe_print_exception("Load previous open list", e)
     prev_open_df = pd.DataFrame({"Sol#": []})
 
-# Hard stop in Railway mode if open list failed
 if USE_RAILWAY_MODE and (open_list_loaded_ok is False):
     raise RuntimeError("Open list load failed in Railway mode. Aborting to prevent massive append.")
 
@@ -612,13 +638,13 @@ try:
         df_recent = df_full.copy()
 
     cols_to_drop = [
-        "ArchiveType","OrganizationType","NoticeId","AdditionalInfoLink",
-        "Award$","Awardee","AwardNumber",
-        "PopCity","PopCountry","PopState","PopStreetAddress","PopZip",
-        "PrimaryContactFax","PrimaryContactTitle","SecondaryContactFax","SecondaryContactTitle",
-        "SetASide","SetASideCode",
-        "CGAC","FPDS Code","AAC Code","ZipCode","CountryCode","Type",
-        "BaseType","Office","Department/Ind.Agency","ArchiveDate"
+        "ArchiveType", "OrganizationType", "NoticeId", "AdditionalInfoLink",
+        "Award$", "Awardee", "AwardNumber",
+        "PopCity", "PopCountry", "PopState", "PopStreetAddress", "PopZip",
+        "PrimaryContactFax", "PrimaryContactTitle", "SecondaryContactFax", "SecondaryContactTitle",
+        "SetASide", "SetASideCode",
+        "CGAC", "FPDS Code", "AAC Code", "ZipCode", "CountryCode", "Type",
+        "BaseType", "Office", "Department/Ind.Agency", "ArchiveDate"
     ]
     before_cols = len(df_recent.columns)
     df_recent = df_recent.drop(columns=cols_to_drop, errors="ignore")
@@ -754,6 +780,7 @@ def clean_number(num):
         return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
     return None
 
+
 def clean_emails(*vals):
     emails = []
     for v in vals:
@@ -770,6 +797,7 @@ def clean_emails(*vals):
             continue
         seen.append(e)
     return ";".join(seen) if len(seen) > 0 else None
+
 
 df5 = pd.DataFrame()
 try:
@@ -830,8 +858,8 @@ try:
 
     df5 = df5.drop(
         columns=[
-            "PrimaryContactFullname","PrimaryContactEmail","PrimaryContactPhone",
-            "SecondaryContactFullname","SecondaryContactEmail","SecondaryContactPhone",
+            "PrimaryContactFullname", "PrimaryContactEmail", "PrimaryContactPhone",
+            "SecondaryContactFullname", "SecondaryContactEmail", "SecondaryContactPhone",
         ],
         errors="ignore",
     )
@@ -905,6 +933,7 @@ OUT_CAT = "category_alarm_8_raw"
 COL_NAICS = "2022 NAICS Title"
 COL_PSC = "PRODUCT AND SERVICE CODE NAME"
 
+
 def row_has_summary(df_: pd.DataFrame, i: int) -> bool:
     if OUT_SUM in df_.columns:
         s = str(df_.at[i, OUT_SUM]).strip()
@@ -914,6 +943,7 @@ def row_has_summary(df_: pd.DataFrame, i: int) -> bool:
             return False
         return True
     return False
+
 
 gpt_stop_flag = False
 
@@ -1062,7 +1092,8 @@ except Exception as e:
 # STEP 11: PUSH OUTPUTS (RAILWAY MODE)
 # =========================================================
 
-# STEP 11
+print("=== STEP 11: PUSH OUTPUTS (RAILWAY MODE) ===")
+
 if USE_RAILWAY_MODE:
     try:
         http_post_csv_multipart(
@@ -1078,6 +1109,10 @@ if USE_RAILWAY_MODE:
 
     try:
         df_to_push = df7 if isinstance(df7, pd.DataFrame) else pd.DataFrame()
+        if UPLOAD_FRESH_LIMIT_25 and isinstance(df_to_push, pd.DataFrame) and (df_to_push.empty is False):
+            print("UPLOAD_FRESH_LIMIT_25 enabled. Uploading only first 25 rows for testing.")
+            df_to_push = df_to_push.head(25).copy()
+
         http_post_csv_multipart(
             UPLOAD_RESULTS_ENDPOINT,
             RAILWAY_API_SECRET,
@@ -1088,7 +1123,10 @@ if USE_RAILWAY_MODE:
         print("Pushed fresh file.")
     except Exception as e:
         safe_print_exception("Push fresh file", e)
+else:
+    print("Local mode. Skipped pushes.")
 
+print("=== DONE ===")
 
 
 # In[ ]:
