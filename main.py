@@ -87,7 +87,10 @@ SLEEP_BETWEEN_BATCH_SEC = 0.15
 
 STOP_GPT_ON_RPD_LIMIT = True
 
+# Upload debug toggles
 UPLOAD_FRESH_LIMIT_25 = os.getenv("UPLOAD_FRESH_LIMIT_25", "false").strip().lower() in ("1", "true", "yes")
+FRESH_UPLOAD_CHUNK_ROWS = int(os.getenv("FRESH_UPLOAD_CHUNK_ROWS", "0"))  # 0 means single upload, else chunk rows
+UPLOAD_TIMEOUT_SEC = int(os.getenv("UPLOAD_TIMEOUT_SEC", "600"))
 
 CATEGORY_LIST = [
     "IT and Cyber",
@@ -134,7 +137,6 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SAM_CSV_NAME = "ContractOpportunitiesFullCSV.csv"
 SAM_CSV_PATH = DOWNLOAD_DIR / SAM_CSV_NAME
 
-# Local disk outputs (filenames do not matter, remote filenames do)
 CLOSED_OUT_PATH = DOWNLOAD_DIR / "tenders_now_closed.csv"
 NEW_OPEN_OUT_PATH = DOWNLOAD_DIR / "tenders_add_fresh.csv"
 
@@ -191,37 +193,30 @@ def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
     return read_csv_safely_text(resp.text)
 
 
-# =========================================================
-# UPLOAD FIX
-# - 400 error happens because Lovable validates the multipart FIELD NAME.
-# - It expects the field key to equal the allowed filename.
-# - So files must be: {remote_filename: (remote_filename, bytes, "text/csv")}
-# - Also chunk fresh upload to avoid 504.
-# =========================================================
-
-def http_post_csv_multipart(
-    url: str,
-    secret: str,
-    df: pd.DataFrame,
-    remote_filename: str,
-    timeout: int = 600,
-    max_attempts: int = 3,
-) -> None:
+def _validate_remote_filename(remote_filename: str) -> str:
     allowed = {
         "tenders_open_current.csv",
         "tender_was_open_now_close_live.csv",
         "tender_append_fresh_data.csv",
     }
-    if remote_filename not in allowed:
-        raise RuntimeError(f"Invalid upload filename: {remote_filename}")
+    fn = (remote_filename or "").strip()
+    if fn == "":
+        raise RuntimeError("Remote filename empty")
+    if fn not in allowed:
+        raise RuntimeError(f"Invalid file name. Allowed: {sorted(list(allowed))}. Got: {repr(fn)}")
+    return fn
 
+
+def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, remote_filename: str, timeout: int = 600) -> None:
+    fn = _validate_remote_filename(remote_filename)
     csv_bytes = df.to_csv(index=False).encode("utf-8")
 
-    # CRITICAL: multipart field name MUST equal the remote filename
-    files = {remote_filename: (remote_filename, csv_bytes, "text/csv")}
+    # CRITICAL FIX:
+    # Supabase function checks the multipart field name keys.
+    # Field name must equal the allowed filename.
+    files = {fn: (fn, csv_bytes, "text/csv")}
 
-    last_err = None
-    for attempt in range(1, max_attempts + 1):
+    for attempt in (1, 2, 3):
         try:
             resp = requests.post(
                 url,
@@ -230,80 +225,43 @@ def http_post_csv_multipart(
                 timeout=timeout,
             )
             if resp.status_code in (200, 201, 204):
-                print("Upload OK:", remote_filename, "bytes:", len(csv_bytes))
+                print("Upload OK:", fn, "bytes:", len(csv_bytes))
                 return
             raise RuntimeError(f"POST failed {resp.status_code}: {resp.text[:800]}")
-        except requests.exceptions.Timeout as e:
-            last_err = e
-            if attempt == max_attempts:
-                raise RuntimeError(f"POST timed out {max_attempts} times: {remote_filename}")
+        except requests.exceptions.Timeout:
+            if attempt == 3:
+                raise RuntimeError(f"POST timed out 3 times for {fn}")
             backoff = 2 * attempt
-            print("[WARN] Upload timeout. retry in", backoff, "sec. attempt", attempt, "/", max_attempts, "file:", remote_filename)
-            time.sleep(backoff)
-        except Exception as e:
-            last_err = e
-            if attempt == max_attempts:
-                raise
-            backoff = 2 * attempt
-            print("[WARN] Upload failed. retry in", backoff, "sec. attempt", attempt, "/", max_attempts, "file:", remote_filename)
+            print("[WARN] Upload timeout. retry in", backoff, "sec. attempt", attempt, "/3. file:", fn)
             time.sleep(backoff)
 
-    raise RuntimeError(f"Upload failed: {remote_filename} err={last_err}")
 
+def post_df_maybe_chunked(url: str, secret: str, df: pd.DataFrame, remote_filename: str, timeout: int, chunk_rows: int) -> None:
+    fn = _validate_remote_filename(remote_filename)
 
-def reduce_fresh_payload(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame()
+        print("Upload empty df:", fn)
+        http_post_csv_multipart(url, secret, pd.DataFrame(), fn, timeout=timeout)
+        return
 
-    keep_cols = [
-        "Sol#", "PostedDate", "ResponseDeadLine",
-        "NaicsCode", "2022 NAICS Title",
-        "ClassificationCode", "PSC CODE", "PRODUCT AND SERVICE CODE NAME",
-        "summary_1_sentence", "category_alarm_8_raw",
-        "contact_emails", "phone_numbers", "State",
-        "status", "last_update",
-    ]
-    present = [c for c in keep_cols if c in df.columns]
-    slim = df[present].copy()
-
-    caps = {
-        "summary_1_sentence": 260,
-        "2022 NAICS Title": 160,
-        "PRODUCT AND SERVICE CODE NAME": 160,
-        "contact_emails": 220,
-        "phone_numbers": 80,
-        "State": 40,
-        "category_alarm_8_raw": 60,
-    }
-    for c, lim in caps.items():
-        if c in slim.columns:
-            slim[c] = slim[c].astype(str).apply(lambda x: clean_text(x, lim))
-
-    return slim
-
-
-def upload_fresh_in_chunks(
-    url: str,
-    secret: str,
-    df: pd.DataFrame,
-    remote_filename: str,
-    chunk_rows: int = 500,
-    timeout: int = 600,
-) -> None:
-    if df is None or df.empty:
-        http_post_csv_multipart(url, secret, pd.DataFrame(), remote_filename, timeout=timeout)
+    if chunk_rows <= 0:
+        print("Upload single:", fn, "rows:", len(df), "cols:", len(df.columns))
+        http_post_csv_multipart(url, secret, df, fn, timeout=timeout)
         return
 
     total = len(df)
-    parts = (total + chunk_rows - 1) // chunk_rows
-    print("Fresh upload chunks:", parts, "rows:", total, "chunk_rows:", chunk_rows)
+    chunks = []
+    start = 0
+    while start < total:
+        end = min(start + chunk_rows, total)
+        chunks.append(df.iloc[start:end].copy())
+        start = end
 
-    for i in range(parts):
-        a = i * chunk_rows
-        b = min((i + 1) * chunk_rows, total)
-        chunk = df.iloc[a:b].copy()
-        print("Uploading chunk", i + 1, "/", parts, "rows", len(chunk))
-        http_post_csv_multipart(url, secret, chunk, remote_filename, timeout=timeout)
+    print("Upload chunked:", fn, "chunks:", len(chunks), "rows:", total, "chunk_rows:", chunk_rows)
+    for i, part in enumerate(chunks, start=1):
+        print("Uploading chunk", i, "/", len(chunks), "rows", len(part))
+        http_post_csv_multipart(url, secret, part, fn, timeout=timeout)
+        time.sleep(0.2)
 
 
 def load_previous_open_list() -> pd.DataFrame:
@@ -598,6 +556,7 @@ prev_open_set = set(prev_open_df["Sol#"].dropna().astype(str))
 if "" in prev_open_set:
     prev_open_set.remove("")
 
+
 print("=== STEP 1: SAM.GOV DOWNLOAD ===")
 
 if (DOWNLOAD_SAM is True) and SAM_CSV_PATH.exists() and (SAM_CSV_PATH.stat().st_size >= MIN_SAM_BYTES_SKIP_DOWNLOAD):
@@ -682,6 +641,7 @@ print("SAM_CSV_PATH:", str(SAM_CSV_PATH), "| exists:", SAM_CSV_PATH.exists())
 if SAM_CSV_PATH.exists():
     print("SAM size:", bytes_human(SAM_CSV_PATH.stat().st_size))
 
+
 print("=== STEP 2: LOAD SAM (FULL) + RECENT FILTER ===")
 
 df_full = pd.DataFrame()
@@ -725,6 +685,7 @@ except Exception as e:
     df_full = pd.DataFrame()
     df_recent = pd.DataFrame()
 
+
 print("=== STEP 3: CLOSED FROM PREV OPEN (FULL SAM) ===")
 
 closed_out_df = pd.DataFrame(columns=["Sol#", "close_reason", "AwardDate"])
@@ -760,6 +721,7 @@ try:
 except Exception as e:
     safe_print_exception("Closed detection", e)
     closed_out_df = pd.DataFrame(columns=["Sol#", "close_reason", "AwardDate"])
+
 
 print("=== STEP 4: NEW OPEN TO ENRICH (RECENT ONLY) ===")
 
@@ -803,6 +765,7 @@ try:
 except Exception as e:
     safe_print_exception("New-open detection", e)
     main_up6 = pd.DataFrame()
+
 
 print("=== STEP 5: CLEAN CONTACT FIELDS ===")
 
@@ -905,6 +868,7 @@ except Exception as e:
     safe_print_exception("Contact cleanup", e)
     df5 = main_up6.copy() if isinstance(main_up6, pd.DataFrame) else pd.DataFrame()
 
+
 print("=== STEP 6: NAICS + PSC LOOKUPS ===")
 
 df7 = pd.DataFrame()
@@ -937,12 +901,14 @@ except Exception as e:
     safe_print_exception("NAICS+PSC merge", e)
     df7 = df5.copy() if isinstance(df5, pd.DataFrame) else pd.DataFrame()
 
+
 print("=== STEP 7: DEFAULTS ===")
 if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
     df7["status"] = "open"
     df7["last_update"] = date.today().isoformat()
 else:
     print("No new open rows, defaults skipped")
+
 
 print("=== STEP 8: GPT SUMMARY ONLY + STEP 9: LOCAL CATEGORY (8) ===")
 
@@ -1033,10 +999,10 @@ if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
                     is_429 = ("429" in msg) or ("rate_limit" in msg.lower())
                     if is_429 is True:
                         wait_s = detect_retry_after_seconds(e)
-                        print(f"[WARN] 429 rate limit. sleep {wait_s:.1f}s. attempt {attempt}/{MAX_RETRIES_429}")
+                        print("429 rate limit. sleep", f"{wait_s:.1f}", "sec. attempt", attempt, "/", MAX_RETRIES_429)
                         time.sleep(wait_s)
                         if attempt >= MAX_RETRIES_429:
-                            print("[WARN] 429 persisted. stopping GPT for this run.")
+                            print("429 persisted. stopping GPT for this run.")
                             if STOP_GPT_ON_RPD_LIMIT is True:
                                 gpt_stop_flag = True
                                 out_map = {}
@@ -1060,7 +1026,7 @@ if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
             elapsed = time.time() - start_t
             rps = processed_rows / elapsed if elapsed > 0 else 0.0
             if (b_ix % PRINT_EVERY_BATCH) == 0:
-                print(f"Batch {b_ix}/{len(batches)} done. rows {processed_rows}/{len(eligible_idxs)} rate {rps:.2f} rows/sec")
+                print("Batch", b_ix, "/", len(batches), "done. rows", processed_rows, "/", len(eligible_idxs), "rate", f"{rps:.2f}", "rows/sec")
 
             if SLEEP_BETWEEN_BATCH_SEC > 0:
                 time.sleep(SLEEP_BETWEEN_BATCH_SEC)
@@ -1103,17 +1069,42 @@ try:
 except Exception as e:
     safe_print_exception("Write new enriched file", e)
 
+
 print("=== STEP 11: PUSH OUTPUTS (RAILWAY MODE) ===")
+
+def reduce_fresh_payload(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    keep_cols = [
+        "Sol#", "PostedDate", "ResponseDeadLine",
+        "NaicsCode", "2022 NAICS Title",
+        "ClassificationCode", "PSC CODE", "PRODUCT AND SERVICE CODE NAME",
+        "summary_1_sentence", "category_alarm_8_raw",
+        "contact_emails", "phone_numbers", "State",
+        "status", "last_update",
+    ]
+    present = [c for c in keep_cols if c in df.columns]
+    slim = df[present].copy()
+
+    for c in ["summary_1_sentence", "2022 NAICS Title", "PRODUCT AND SERVICE CODE NAME", "contact_emails"]:
+        if c in slim.columns:
+            lim = 260 if c == "summary_1_sentence" else 180
+            slim[c] = slim[c].astype(str).apply(lambda x: clean_text(x, lim))
+
+    return slim
+
 
 if USE_RAILWAY_MODE:
     try:
-        print("Upload closed remote:", CLOSED_REMOTE_FILENAME, "rows:", len(closed_out_df))
-        http_post_csv_multipart(
+        print("Upload closed remote:", repr(CLOSED_REMOTE_FILENAME), "rows:", len(closed_out_df))
+        post_df_maybe_chunked(
             UPLOAD_RESULTS_ENDPOINT,
             RAILWAY_API_SECRET,
             closed_out_df,
             CLOSED_REMOTE_FILENAME,
-            timeout=600
+            timeout=UPLOAD_TIMEOUT_SEC,
+            chunk_rows=0
         )
         print("Pushed closed file.")
     except Exception as e:
@@ -1127,18 +1118,16 @@ if USE_RAILWAY_MODE:
             print("UPLOAD_FRESH_LIMIT_25 enabled. Uploading only first 25 rows for testing.")
             df_to_push = df_to_push.head(25).copy()
 
-        print("Upload fresh remote:", FRESH_REMOTE_FILENAME, "rows:", len(df_to_push), "cols:", len(df_to_push.columns))
-
-        upload_fresh_in_chunks(
+        chunk_rows = FRESH_UPLOAD_CHUNK_ROWS
+        post_df_maybe_chunked(
             UPLOAD_RESULTS_ENDPOINT,
             RAILWAY_API_SECRET,
             df_to_push,
             FRESH_REMOTE_FILENAME,
-            chunk_rows=500,
-            timeout=600,
+            timeout=UPLOAD_TIMEOUT_SEC,
+            chunk_rows=chunk_rows
         )
-
-        print("Pushed fresh file (chunked).")
+        print("Pushed fresh file.")
     except Exception as e:
         safe_print_exception("Push fresh file", e)
 else:
