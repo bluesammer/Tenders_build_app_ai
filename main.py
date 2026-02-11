@@ -191,7 +191,22 @@ def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
     return read_csv_safely_text(resp.text)
 
 
-def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, remote_filename: str, timeout: int = 600) -> None:
+# =========================================================
+# UPLOAD FIX
+# - 400 error happens because Lovable validates the multipart FIELD NAME.
+# - It expects the field key to equal the allowed filename.
+# - So files must be: {remote_filename: (remote_filename, bytes, "text/csv")}
+# - Also chunk fresh upload to avoid 504.
+# =========================================================
+
+def http_post_csv_multipart(
+    url: str,
+    secret: str,
+    df: pd.DataFrame,
+    remote_filename: str,
+    timeout: int = 600,
+    max_attempts: int = 3,
+) -> None:
     allowed = {
         "tenders_open_current.csv",
         "tender_was_open_now_close_live.csv",
@@ -202,12 +217,11 @@ def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, remote_file
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
 
-    # IMPORTANT:
-    # Always use a stable multipart field name "file".
-    # Always force the remote filename via the tuple's first element.
-    files = {"file": (remote_filename, csv_bytes, "text/csv")}
+    # CRITICAL: multipart field name MUST equal the remote filename
+    files = {remote_filename: (remote_filename, csv_bytes, "text/csv")}
 
-    for attempt in [1, 2, 3]:
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(
                 url,
@@ -219,12 +233,77 @@ def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, remote_file
                 print("Upload OK:", remote_filename, "bytes:", len(csv_bytes))
                 return
             raise RuntimeError(f"POST failed {resp.status_code}: {resp.text[:800]}")
-        except requests.exceptions.Timeout:
-            if attempt == 3:
-                raise RuntimeError(f"POST timed out 3 times for {remote_filename}")
+        except requests.exceptions.Timeout as e:
+            last_err = e
+            if attempt == max_attempts:
+                raise RuntimeError(f"POST timed out {max_attempts} times: {remote_filename}")
             backoff = 2 * attempt
-            print("[WARN] Upload timeout. retry in", backoff, "sec. attempt", attempt, "/3. file:", remote_filename)
+            print("[WARN] Upload timeout. retry in", backoff, "sec. attempt", attempt, "/", max_attempts, "file:", remote_filename)
             time.sleep(backoff)
+        except Exception as e:
+            last_err = e
+            if attempt == max_attempts:
+                raise
+            backoff = 2 * attempt
+            print("[WARN] Upload failed. retry in", backoff, "sec. attempt", attempt, "/", max_attempts, "file:", remote_filename)
+            time.sleep(backoff)
+
+    raise RuntimeError(f"Upload failed: {remote_filename} err={last_err}")
+
+
+def reduce_fresh_payload(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    keep_cols = [
+        "Sol#", "PostedDate", "ResponseDeadLine",
+        "NaicsCode", "2022 NAICS Title",
+        "ClassificationCode", "PSC CODE", "PRODUCT AND SERVICE CODE NAME",
+        "summary_1_sentence", "category_alarm_8_raw",
+        "contact_emails", "phone_numbers", "State",
+        "status", "last_update",
+    ]
+    present = [c for c in keep_cols if c in df.columns]
+    slim = df[present].copy()
+
+    caps = {
+        "summary_1_sentence": 260,
+        "2022 NAICS Title": 160,
+        "PRODUCT AND SERVICE CODE NAME": 160,
+        "contact_emails": 220,
+        "phone_numbers": 80,
+        "State": 40,
+        "category_alarm_8_raw": 60,
+    }
+    for c, lim in caps.items():
+        if c in slim.columns:
+            slim[c] = slim[c].astype(str).apply(lambda x: clean_text(x, lim))
+
+    return slim
+
+
+def upload_fresh_in_chunks(
+    url: str,
+    secret: str,
+    df: pd.DataFrame,
+    remote_filename: str,
+    chunk_rows: int = 500,
+    timeout: int = 600,
+) -> None:
+    if df is None or df.empty:
+        http_post_csv_multipart(url, secret, pd.DataFrame(), remote_filename, timeout=timeout)
+        return
+
+    total = len(df)
+    parts = (total + chunk_rows - 1) // chunk_rows
+    print("Fresh upload chunks:", parts, "rows:", total, "chunk_rows:", chunk_rows)
+
+    for i in range(parts):
+        a = i * chunk_rows
+        b = min((i + 1) * chunk_rows, total)
+        chunk = df.iloc[a:b].copy()
+        print("Uploading chunk", i + 1, "/", parts, "rows", len(chunk))
+        http_post_csv_multipart(url, secret, chunk, remote_filename, timeout=timeout)
 
 
 def load_previous_open_list() -> pd.DataFrame:
@@ -1026,29 +1105,6 @@ except Exception as e:
 
 print("=== STEP 11: PUSH OUTPUTS (RAILWAY MODE) ===")
 
-def reduce_fresh_payload(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    keep_cols = [
-        "Sol#", "PostedDate", "ResponseDeadLine",
-        "NaicsCode", "2022 NAICS Title",
-        "ClassificationCode", "PSC CODE", "PRODUCT AND SERVICE CODE NAME",
-        "summary_1_sentence", "category_alarm_8_raw",
-        "contact_emails", "phone_numbers", "State",
-        "status", "last_update",
-    ]
-    present = [c for c in keep_cols if c in df.columns]
-    slim = df[present].copy()
-
-    # Ensure no giant strings sneak in
-    for c in ["summary_1_sentence", "2022 NAICS Title", "PRODUCT AND SERVICE CODE NAME", "contact_emails"]:
-        if c in slim.columns:
-            slim[c] = slim[c].astype(str).apply(lambda x: clean_text(x, 260 if c == "summary_1_sentence" else 180))
-
-    return slim
-
-
 if USE_RAILWAY_MODE:
     try:
         print("Upload closed remote:", CLOSED_REMOTE_FILENAME, "rows:", len(closed_out_df))
@@ -1065,8 +1121,6 @@ if USE_RAILWAY_MODE:
 
     try:
         df_to_push = df7.copy() if isinstance(df7, pd.DataFrame) else pd.DataFrame()
-
-        # Shrink payload to avoid 504 timeouts
         df_to_push = reduce_fresh_payload(df_to_push)
 
         if UPLOAD_FRESH_LIMIT_25 and (df_to_push.empty is False):
@@ -1074,14 +1128,17 @@ if USE_RAILWAY_MODE:
             df_to_push = df_to_push.head(25).copy()
 
         print("Upload fresh remote:", FRESH_REMOTE_FILENAME, "rows:", len(df_to_push), "cols:", len(df_to_push.columns))
-        http_post_csv_multipart(
+
+        upload_fresh_in_chunks(
             UPLOAD_RESULTS_ENDPOINT,
             RAILWAY_API_SECRET,
             df_to_push,
             FRESH_REMOTE_FILENAME,
-            timeout=600
+            chunk_rows=500,
+            timeout=600,
         )
-        print("Pushed fresh file.")
+
+        print("Pushed fresh file (chunked).")
     except Exception as e:
         safe_print_exception("Push fresh file", e)
 else:
