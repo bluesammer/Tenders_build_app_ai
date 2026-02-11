@@ -1039,6 +1039,11 @@ if USE_RAILWAY_MODE:
 
 print("=== DONE ===")
 
+import sys
+sys.stdout.flush()
+sys.stderr.flush()
+sys.exit(0)
+
 
 # In[ ]:
 
