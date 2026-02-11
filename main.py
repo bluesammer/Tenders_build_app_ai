@@ -87,21 +87,12 @@ SLEEP_BETWEEN_BATCH_SEC = 0.15
 
 STOP_GPT_ON_RPD_LIMIT = True
 
-# Upload debug toggles
-UPLOAD_FRESH_LIMIT_25 = os.getenv("UPLOAD_FRESH_LIMIT_25", "false").strip().lower() in ("1", "true", "yes")
-FRESH_UPLOAD_CHUNK_ROWS = int(os.getenv("FRESH_UPLOAD_CHUNK_ROWS", "0"))  # 0 means single upload, else chunk rows
 UPLOAD_TIMEOUT_SEC = int(os.getenv("UPLOAD_TIMEOUT_SEC", "600"))
+UPLOAD_FRESH_LIMIT_25 = os.getenv("UPLOAD_FRESH_LIMIT_25", "false").strip().lower() in ("1", "true", "yes")
 
-CATEGORY_LIST = [
-    "IT and Cyber",
-    "Medical and Healthcare",
-    "Energy and Utilities",
-    "Professional Services",
-    "Construction and Trades",
-    "Transportation and Logistics",
-    "Manufacturing",
-    "Other",
-]
+# Chunk upload to avoid 504
+FRESH_UPLOAD_CHUNK_ROWS = int(os.getenv("FRESH_UPLOAD_CHUNK_ROWS", "400"))  # set 0 to disable
+UPLOAD_SLEEP_BETWEEN_PARTS_SEC = float(os.getenv("UPLOAD_SLEEP_BETWEEN_PARTS_SEC", "0.35"))
 
 # Lovable endpoints
 OPEN_LIST_ENDPOINT = "https://okynhjreumnekmeudwje.supabase.co/functions/v1/get-railway-csv"
@@ -112,7 +103,6 @@ CLOSED_REMOTE_FILENAME = "tender_was_open_now_close_live.csv"
 FRESH_REMOTE_FILENAME = "tender_append_fresh_data.csv"
 OPEN_REMOTE_FILENAME = "tenders_open_current.csv"
 
-# Local open list export (local mode only)
 LOCAL_OPEN_LIST_PATH = r"C:\Users\Blues\upwork\10000k_conrcats_merx_govt_contracts_USA 2026 -Better\downloads\maybe just swap with same name\tenders_open_current-export-2026-02-09_12-59-53.csv"
 
 
@@ -156,7 +146,7 @@ def bytes_human(n: int) -> str:
 
 
 def safe_print_exception(tag: str, e: Exception) -> None:
-    print(f"[ERROR] {tag}: {type(e).__name__}: {e}")
+    print("[ERROR]", tag + ":", type(e).__name__ + ":", str(e))
 
 
 def read_csv_safely_path(p: Path) -> pd.DataFrame:
@@ -187,7 +177,7 @@ def clean_text(x, limit: int) -> str:
 def http_get_csv_df(url: str, secret: str, timeout: int = 90) -> pd.DataFrame:
     resp = requests.get(url, headers={"x-railway-secret": secret}, timeout=timeout)
     if resp.status_code != 200:
-        raise RuntimeError(f"GET failed {resp.status_code}: {resp.text[:800]}")
+        raise RuntimeError("GET failed " + str(resp.status_code) + ": " + resp.text[:800])
     if resp.text.strip() == "":
         return pd.DataFrame()
     return read_csv_safely_text(resp.text)
@@ -202,66 +192,87 @@ def _validate_remote_filename(remote_filename: str) -> str:
     fn = (remote_filename or "").strip()
     if fn == "":
         raise RuntimeError("Remote filename empty")
-    if fn not in allowed:
-        raise RuntimeError(f"Invalid file name. Allowed: {sorted(list(allowed))}. Got: {repr(fn)}")
-    return fn
+    if fn in allowed:
+        return fn
+    raise RuntimeError("Invalid file name. Allowed: " + ", ".join(sorted(list(allowed))))
 
 
-def http_post_csv_multipart(url: str, secret: str, df: pd.DataFrame, remote_filename: str, timeout: int = 600) -> None:
+def post_csv_dual_keys(url: str, secret: str, csv_bytes: bytes, remote_filename: str, timeout: int) -> None:
+    fn = _validate_remote_filename(remote_filename)
+
+    # Dual keys + explicit filename field
+    files = {
+        "file": (fn, csv_bytes, "text/csv"),
+        fn: (fn, csv_bytes, "text/csv"),
+    }
+    data = {"filename": fn}
+
+    resp = requests.post(
+        url,
+        headers={"x-railway-secret": secret},
+        files=files,
+        data=data,
+        timeout=timeout,
+    )
+    if resp.status_code in (200, 201, 204):
+        print("Upload OK:", fn, "bytes:", len(csv_bytes))
+        return
+    raise RuntimeError("POST failed " + str(resp.status_code) + ": " + resp.text[:800])
+
+
+def post_df_with_retries(url: str, secret: str, df: pd.DataFrame, remote_filename: str, timeout: int) -> None:
     fn = _validate_remote_filename(remote_filename)
     csv_bytes = df.to_csv(index=False).encode("utf-8")
 
-    # CRITICAL FIX:
-    # Supabase function checks the multipart field name keys.
-    # Field name must equal the allowed filename.
-    files = {fn: (fn, csv_bytes, "text/csv")}
-
     for attempt in (1, 2, 3):
         try:
-            resp = requests.post(
-                url,
-                headers={"x-railway-secret": secret},
-                files=files,
-                timeout=timeout,
-            )
-            if resp.status_code in (200, 201, 204):
-                print("Upload OK:", fn, "bytes:", len(csv_bytes))
-                return
-            raise RuntimeError(f"POST failed {resp.status_code}: {resp.text[:800]}")
+            post_csv_dual_keys(url, secret, csv_bytes, fn, timeout)
+            return
         except requests.exceptions.Timeout:
             if attempt == 3:
-                raise RuntimeError(f"POST timed out 3 times for {fn}")
+                raise RuntimeError("POST timed out 3 times for " + fn)
             backoff = 2 * attempt
             print("[WARN] Upload timeout. retry in", backoff, "sec. attempt", attempt, "/3. file:", fn)
+            time.sleep(backoff)
+        except Exception as e:
+            if attempt == 3:
+                raise
+            backoff = 2 * attempt
+            print("[WARN] Upload failed. retry in", backoff, "sec. attempt", attempt, "/3. file:", fn, "err:", str(e)[:200])
             time.sleep(backoff)
 
 
 def post_df_maybe_chunked(url: str, secret: str, df: pd.DataFrame, remote_filename: str, timeout: int, chunk_rows: int) -> None:
     fn = _validate_remote_filename(remote_filename)
 
-    if df is None or df.empty:
-        print("Upload empty df:", fn)
-        http_post_csv_multipart(url, secret, pd.DataFrame(), fn, timeout=timeout)
+    if df is None:
+        df = pd.DataFrame()
+
+    if df.empty:
+        print("Upload empty:", fn)
+        post_df_with_retries(url, secret, pd.DataFrame(), fn, timeout)
         return
 
     if chunk_rows <= 0:
         print("Upload single:", fn, "rows:", len(df), "cols:", len(df.columns))
-        http_post_csv_multipart(url, secret, df, fn, timeout=timeout)
+        post_df_with_retries(url, secret, df, fn, timeout)
         return
 
     total = len(df)
-    chunks = []
+    parts = []
     start = 0
     while start < total:
-        end = min(start + chunk_rows, total)
-        chunks.append(df.iloc[start:end].copy())
+        end = start + chunk_rows
+        if end > total:
+            end = total
+        parts.append(df.iloc[start:end].copy())
         start = end
 
-    print("Upload chunked:", fn, "chunks:", len(chunks), "rows:", total, "chunk_rows:", chunk_rows)
-    for i, part in enumerate(chunks, start=1):
-        print("Uploading chunk", i, "/", len(chunks), "rows", len(part))
-        http_post_csv_multipart(url, secret, part, fn, timeout=timeout)
-        time.sleep(0.2)
+    print("Upload chunked:", fn, "chunks:", len(parts), "rows:", total, "chunk_rows:", chunk_rows)
+    for i, part in enumerate(parts, start=1):
+        print("Uploading part", i, "/", len(parts), "rows", len(part))
+        post_df_with_retries(url, secret, part, fn, timeout)
+        time.sleep(UPLOAD_SLEEP_BETWEEN_PARTS_SEC)
 
 
 def load_previous_open_list() -> pd.DataFrame:
@@ -305,8 +316,7 @@ def build_driver(download_dir: Path) -> webdriver.Chrome:
 
     if USE_RAILWAY_MODE:
         if (os.path.exists(CHROME_BIN) is False) or (os.path.exists(CHROMEDRIVER_PATH) is False):
-            raise RuntimeError(f"Chrome runtime missing: {CHROME_BIN} or {CHROMEDRIVER_PATH}")
-
+            raise RuntimeError("Chrome runtime missing")
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -339,7 +349,7 @@ def wait_for_file_stable(path: Path, timeout_sec: int = 1200, stable_sec: int = 
                 last_size = size
         time.sleep(2)
 
-    raise RuntimeError(f"Timeout waiting for stable file: {path}")
+    raise RuntimeError("Timeout waiting for stable file")
 
 
 def norm_sol(x) -> str:
@@ -370,7 +380,7 @@ def fallback_summary(title: str, desc: str) -> str:
     t = clean_text(title, 140)
     d = clean_text(desc, 220)
     if t != "":
-        return validate_summary(f"Provide {t.lower()}.")
+        return validate_summary("Provide " + t.lower() + ".")
     if d != "":
         base = d
         if base.endswith(".") is False:
@@ -397,7 +407,7 @@ def detect_retry_after_seconds(err: Exception) -> float:
 
 
 # =========================================================
-# CATEGORY (8) RULE ENGINE
+# CATEGORY (8)
 # =========================================================
 
 KW_MED = re.compile(r"\b(medical|clinical|hospital|pharma|pharmaceutical|drug|laborator(y|ies)|diagnostic|patient|clinic|healthcare|nursing)\b", re.I)
@@ -435,43 +445,19 @@ def text_blob_raw(r):
     return " ".join(parts).lower()
 
 
-def is_it(text):
-    if KW_IT_STRONG.search(text):
-        return True
-    if KW_IT_MED.search(text):
-        return True
-    if KW_IT_WEAK.search(text) and KW_IT_MED.search(text):
-        return True
-    return False
-
-
-def is_cons(text):
-    return bool(KW_CONS1.search(text) or KW_CONS2.search(text))
-
-
-def is_pro(text):
-    return bool(
-        KW_PRO1.search(text) or
-        KW_PRO2.search(text) or
-        KW_PRO3.search(text) or
-        KW_PRO4.search(text) or
-        KW_PRO5.search(text)
-    )
-
-
 def map_category_8_local(row):
     p = psc_prefix(row.get("PSC CODE", ""))
     t = text_blob_raw(row)
 
-    if is_it(t):
+    if KW_IT_STRONG.search(t) or KW_IT_MED.search(t):
         return "IT and Cyber"
     if KW_MED.search(t):
         return "Medical and Healthcare"
     if KW_ENERGY.search(t):
         return "Energy and Utilities"
-    if is_pro(t):
+    if KW_PRO1.search(t) or KW_PRO2.search(t) or KW_PRO3.search(t) or KW_PRO4.search(t) or KW_PRO5.search(t):
         return "Professional Services"
-    if is_cons(t):
+    if KW_CONS1.search(t) or KW_CONS2.search(t):
         return "Construction and Trades"
     if KW_TRANS.search(t):
         return "Transportation and Logistics"
@@ -493,7 +479,7 @@ def map_category_8_local(row):
 
 
 # =========================================================
-# GPT SUMMARY ONLY
+# GPT SUMMARY
 # =========================================================
 
 def gpt_summary_batch(client: OpenAI, records: list) -> dict:
@@ -550,12 +536,11 @@ except Exception as e:
     prev_open_df = pd.DataFrame({"Sol#": []})
 
 if USE_RAILWAY_MODE and (open_list_loaded_ok is False):
-    raise RuntimeError("Open list load failed in Railway mode. Aborting to prevent massive append.")
+    raise RuntimeError("Open list load failed in Railway mode")
 
 prev_open_set = set(prev_open_df["Sol#"].dropna().astype(str))
 if "" in prev_open_set:
     prev_open_set.remove("")
-
 
 print("=== STEP 1: SAM.GOV DOWNLOAD ===")
 
@@ -611,8 +596,6 @@ else:
 
             if accepted is True:
                 print("Terms accepted.")
-            else:
-                print("Terms modal skipped or already accepted.")
 
             time.sleep(2)
 
@@ -634,13 +617,10 @@ else:
                     driver.quit()
                 except Exception:
                     pass
-    else:
-        print("DOWNLOAD_SAM=False. Using existing file.")
 
 print("SAM_CSV_PATH:", str(SAM_CSV_PATH), "| exists:", SAM_CSV_PATH.exists())
 if SAM_CSV_PATH.exists():
     print("SAM size:", bytes_human(SAM_CSV_PATH.stat().st_size))
-
 
 print("=== STEP 2: LOAD SAM (FULL) + RECENT FILTER ===")
 
@@ -685,7 +665,6 @@ except Exception as e:
     df_full = pd.DataFrame()
     df_recent = pd.DataFrame()
 
-
 print("=== STEP 3: CLOSED FROM PREV OPEN (FULL SAM) ===")
 
 closed_out_df = pd.DataFrame(columns=["Sol#", "close_reason", "AwardDate"])
@@ -707,11 +686,7 @@ try:
 
         rows = []
         for sol in closed_awarded:
-            rows.append({
-                "Sol#": sol,
-                "close_reason": "awarded",
-                "AwardDate": award_map.get(sol, "")
-            })
+            rows.append({"Sol#": sol, "close_reason": "awarded", "AwardDate": award_map.get(sol, "")})
 
         closed_out_df = pd.DataFrame(rows)
 
@@ -721,7 +696,6 @@ try:
 except Exception as e:
     safe_print_exception("Closed detection", e)
     closed_out_df = pd.DataFrame(columns=["Sol#", "close_reason", "AwardDate"])
-
 
 print("=== STEP 4: NEW OPEN TO ENRICH (RECENT ONLY) ===")
 
@@ -741,7 +715,7 @@ try:
     df_open_recent = df_open_recent.loc[df_open_recent["Sol#"] != ""].copy()
 
     is_prev = df_open_recent["Sol#"].isin(prev_open_set)
-    new_open_df = df_open_recent.loc[~is_prev].copy()
+    new_open_df = df_open_recent.loc[is_prev == False].copy()
     print("New open rows (recent):", len(new_open_df))
 
     if ("PostedDate" in new_open_df.columns) and (len(new_open_df) > 0):
@@ -754,6 +728,7 @@ try:
 
     front_cols = ["Sol#", "PostedDate", "ResponseDeadLine"]
     front = [c for c in front_cols if c in new_open_df.columns]
+    rest = [c for c in new_open_df.columns if c in front_cols]  # placeholder, kept minimal
     rest = [c for c in new_open_df.columns if c not in front]
     main_up6 = new_open_df.loc[:, front + rest].copy()
 
@@ -766,7 +741,6 @@ except Exception as e:
     safe_print_exception("New-open detection", e)
     main_up6 = pd.DataFrame()
 
-
 print("=== STEP 5: CLEAN CONTACT FIELDS ===")
 
 def clean_number(num):
@@ -775,7 +749,7 @@ def clean_number(num):
     digits = re.sub(r"\D", "", str(num))
     if len(digits) >= 10:
         digits = digits[-10:]
-        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+        return "(" + digits[:3] + ") " + digits[3:6] + "-" + digits[6:]
     return None
 
 
@@ -818,9 +792,9 @@ try:
         vals = []
         a = r.get("primary_phone_clean")
         b = r.get("secondary_phone_clean")
-        if pd.notna(a):
+        if pd.isna(a) == False:
             vals.append(a)
-        if pd.notna(b):
+        if pd.isna(b) == False:
             vals.append(b)
         s = ", ".join(vals)
         if s == "":
@@ -868,7 +842,6 @@ except Exception as e:
     safe_print_exception("Contact cleanup", e)
     df5 = main_up6.copy() if isinstance(main_up6, pd.DataFrame) else pd.DataFrame()
 
-
 print("=== STEP 6: NAICS + PSC LOOKUPS ===")
 
 df7 = pd.DataFrame()
@@ -901,16 +874,12 @@ except Exception as e:
     safe_print_exception("NAICS+PSC merge", e)
     df7 = df5.copy() if isinstance(df5, pd.DataFrame) else pd.DataFrame()
 
-
 print("=== STEP 7: DEFAULTS ===")
 if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
     df7["status"] = "open"
     df7["last_update"] = date.today().isoformat()
-else:
-    print("No new open rows, defaults skipped")
 
-
-print("=== STEP 8: GPT SUMMARY ONLY + STEP 9: LOCAL CATEGORY (8) ===")
+print("=== STEP 8: GPT SUMMARY + STEP 9: CATEGORY ===")
 
 TITLE_COL = "Title"
 DESC_COL = "Description"
@@ -919,46 +888,22 @@ OUT_CAT = "category_alarm_8_raw"
 COL_NAICS = "2022 NAICS Title"
 COL_PSC = "PRODUCT AND SERVICE CODE NAME"
 
-
-def row_has_summary(df_: pd.DataFrame, i: int) -> bool:
-    if OUT_SUM in df_.columns:
-        s = str(df_.at[i, OUT_SUM]).strip()
-        if s == "":
-            return False
-        if s.startswith("ERROR:"):
-            return False
-        return True
-    return False
-
-
-gpt_stop_flag = False
-
 if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
-
     if OUT_SUM not in df7.columns:
         df7[OUT_SUM] = ""
     if OUT_CAT not in df7.columns:
         df7[OUT_CAT] = ""
 
     if DISABLE_GPT is True:
-        print("GPT disabled. Using fallback summaries.")
         for i in df7.index.tolist():
-            if row_has_summary(df7, i):
-                continue
             title = clean_text(df7.at[i, TITLE_COL], 500) if TITLE_COL in df7.columns else ""
             desc = clean_text(df7.at[i, DESC_COL], 1600) if DESC_COL in df7.columns else ""
             df7.at[i, OUT_SUM] = fallback_summary(title, desc)
     else:
-        eligible_idxs = []
-        for i in df7.index.tolist():
-            if SKIP_IF_ALREADY_ENRICHED and row_has_summary(df7, i):
-                continue
-            eligible_idxs.append(i)
-
+        eligible_idxs = df7.index.tolist()
         if RANDOM_SAMPLE is True:
             random.seed(RANDOM_SEED)
             random.shuffle(eligible_idxs)
-
         eligible_idxs = eligible_idxs[:MAX_GPT_ROWS_TOTAL]
         print("Eligible summary rows:", len(eligible_idxs), "| MAX_GPT_ROWS_TOTAL:", MAX_GPT_ROWS_TOTAL, "| GPT_BATCH_SIZE:", GPT_BATCH_SIZE)
 
@@ -969,9 +914,6 @@ if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
         start_t = time.time()
 
         for b_ix, batch in enumerate(batches, start=1):
-            if gpt_stop_flag is True:
-                break
-
             records = []
             for i in batch:
                 sol = norm_sol(df7.at[i, "Sol#"]) if "Sol#" in df7.columns else ""
@@ -979,16 +921,10 @@ if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
                 desc = clean_text(df7.at[i, DESC_COL], 1600) if DESC_COL in df7.columns else ""
                 naics_v = clean_text(df7.at[i, COL_NAICS], 180) if COL_NAICS in df7.columns else ""
                 psc_v = clean_text(df7.at[i, COL_PSC], 180) if COL_PSC in df7.columns else ""
-
-                records.append({
-                    "Sol#": sol,
-                    "Title": title,
-                    "Description": desc,
-                    "naics": naics_v,
-                    "psc": psc_v,
-                })
+                records.append({"Sol#": sol, "Title": title, "Description": desc, "naics": naics_v, "psc": psc_v})
 
             attempt = 0
+            out_map = {}
             while True:
                 attempt += 1
                 try:
@@ -1002,14 +938,9 @@ if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
                         print("429 rate limit. sleep", f"{wait_s:.1f}", "sec. attempt", attempt, "/", MAX_RETRIES_429)
                         time.sleep(wait_s)
                         if attempt >= MAX_RETRIES_429:
-                            print("429 persisted. stopping GPT for this run.")
-                            if STOP_GPT_ON_RPD_LIMIT is True:
-                                gpt_stop_flag = True
-                                out_map = {}
-                                break
+                            break
                     else:
                         safe_print_exception("GPT summary batch", e)
-                        out_map = {}
                         break
 
             for i in batch:
@@ -1022,34 +953,21 @@ if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
                     df7.at[i, OUT_SUM] = fallback_summary(title, desc)
 
             processed_rows += len(batch)
-
             elapsed = time.time() - start_t
             rps = processed_rows / elapsed if elapsed > 0 else 0.0
             if (b_ix % PRINT_EVERY_BATCH) == 0:
                 print("Batch", b_ix, "/", len(batches), "done. rows", processed_rows, "/", len(eligible_idxs), "rate", f"{rps:.2f}", "rows/sec")
-
             if SLEEP_BETWEEN_BATCH_SEC > 0:
                 time.sleep(SLEEP_BETWEEN_BATCH_SEC)
 
-        print("GPT summary finished. rows processed:", processed_rows, "gpt_stop_flag:", gpt_stop_flag)
-
     if "PSC CODE" not in df7.columns:
-        if "ClassificationCode" in df7.columns:
-            df7["PSC CODE"] = df7["ClassificationCode"].astype(str)
-        else:
-            df7["PSC CODE"] = ""
-
+        df7["PSC CODE"] = df7["ClassificationCode"].astype(str) if "ClassificationCode" in df7.columns else ""
     if "PRODUCT AND SERVICE CODE NAME" not in df7.columns:
         df7["PRODUCT AND SERVICE CODE NAME"] = ""
-
     if "2022 NAICS Title" not in df7.columns:
         df7["2022 NAICS Title"] = ""
 
     df7[OUT_CAT] = df7.apply(map_category_8_local, axis=1)
-
-else:
-    print("No new open rows, summary skipped, category skipped")
-
 
 print("=== STEP 10: WRITE OUTPUT FILES ===")
 
@@ -1060,20 +978,17 @@ except Exception as e:
     safe_print_exception("Write closed file", e)
 
 try:
-    if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
-        df7.to_csv(NEW_OPEN_OUT_PATH, index=False)
-        print("Wrote new enriched file:", str(NEW_OPEN_OUT_PATH), "| rows:", len(df7))
-    else:
-        pd.DataFrame().to_csv(NEW_OPEN_OUT_PATH, index=False)
-        print("Wrote empty new enriched file:", str(NEW_OPEN_OUT_PATH), "| rows: 0")
+    df7.to_csv(NEW_OPEN_OUT_PATH, index=False)
+    print("Wrote new enriched file:", str(NEW_OPEN_OUT_PATH), "| rows:", len(df7))
 except Exception as e:
     safe_print_exception("Write new enriched file", e)
-
 
 print("=== STEP 11: PUSH OUTPUTS (RAILWAY MODE) ===")
 
 def reduce_fresh_payload(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+    if df is None:
+        return pd.DataFrame()
+    if df.empty:
         return pd.DataFrame()
 
     keep_cols = [
@@ -1091,7 +1006,6 @@ def reduce_fresh_payload(df: pd.DataFrame) -> pd.DataFrame:
         if c in slim.columns:
             lim = 260 if c == "summary_1_sentence" else 180
             slim[c] = slim[c].astype(str).apply(lambda x: clean_text(x, lim))
-
     return slim
 
 
@@ -1111,27 +1025,24 @@ if USE_RAILWAY_MODE:
         safe_print_exception("Push closed file", e)
 
     try:
-        df_to_push = df7.copy() if isinstance(df7, pd.DataFrame) else pd.DataFrame()
-        df_to_push = reduce_fresh_payload(df_to_push)
+        df_to_push = reduce_fresh_payload(df7)
 
         if UPLOAD_FRESH_LIMIT_25 and (df_to_push.empty is False):
-            print("UPLOAD_FRESH_LIMIT_25 enabled. Uploading only first 25 rows for testing.")
+            print("UPLOAD_FRESH_LIMIT_25 enabled. Uploading first 25 rows.")
             df_to_push = df_to_push.head(25).copy()
 
-        chunk_rows = FRESH_UPLOAD_CHUNK_ROWS
+        print("Upload fresh remote:", repr(FRESH_REMOTE_FILENAME), "rows:", len(df_to_push))
         post_df_maybe_chunked(
             UPLOAD_RESULTS_ENDPOINT,
             RAILWAY_API_SECRET,
             df_to_push,
             FRESH_REMOTE_FILENAME,
             timeout=UPLOAD_TIMEOUT_SEC,
-            chunk_rows=chunk_rows
+            chunk_rows=FRESH_UPLOAD_CHUNK_ROWS
         )
         print("Pushed fresh file.")
     except Exception as e:
         safe_print_exception("Push fresh file", e)
-else:
-    print("Local mode. Skipped pushes.")
 
 print("=== DONE ===")
 
