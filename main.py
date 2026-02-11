@@ -78,20 +78,21 @@ MODEL = "gpt-4o-mini"
 
 RANDOM_SAMPLE = False
 RANDOM_SEED = 42
-SKIP_IF_ALREADY_ENRICHED = True
+SKIP_IF_ALREADY_ENRICHED = True  # reserved for later use
 
 GPT_TIMEOUT_SEC = 60
 MAX_RETRIES_429 = 8
 PRINT_EVERY_BATCH = 1
 SLEEP_BETWEEN_BATCH_SEC = 0.15
 
-STOP_GPT_ON_RPD_LIMIT = True
+STOP_GPT_ON_RPD_LIMIT = True  # reserved for later use
 
 UPLOAD_TIMEOUT_SEC = int(os.getenv("UPLOAD_TIMEOUT_SEC", "600"))
 UPLOAD_FRESH_LIMIT_25 = os.getenv("UPLOAD_FRESH_LIMIT_25", "false").strip().lower() in ("1", "true", "yes")
 
-# Chunk upload to avoid 504
-FRESH_UPLOAD_CHUNK_ROWS = int(os.getenv("FRESH_UPLOAD_CHUNK_ROWS", "400"))  # set 0 to disable
+# IMPORTANT: raw upload writes one full file per request.
+# Chunking would overwrite the same remote file multiple times.
+FRESH_UPLOAD_CHUNK_ROWS = 0
 UPLOAD_SLEEP_BETWEEN_PARTS_SEC = float(os.getenv("UPLOAD_SLEEP_BETWEEN_PARTS_SEC", "0.35"))
 
 # Lovable endpoints
@@ -197,26 +198,21 @@ def _validate_remote_filename(remote_filename: str) -> str:
     raise RuntimeError("Invalid file name. Allowed: " + ", ".join(sorted(list(allowed))))
 
 
-def post_csv_dual_keys(url: str, secret: str, csv_bytes: bytes, remote_filename: str, timeout: int) -> None:
+def post_csv_raw(url: str, secret: str, csv_bytes: bytes, remote_filename: str, timeout: int) -> None:
     fn = _validate_remote_filename(remote_filename)
 
-    # Dual keys + explicit filename field
-    files = {
-        "file": (fn, csv_bytes, "text/csv"),
-        fn: (fn, csv_bytes, "text/csv"),
+    headers = {
+        "x-railway-secret": secret,
+        "x-file-name": fn,
+        "content-type": "text/csv",
     }
-    data = {"filename": fn}
 
-    resp = requests.post(
-        url,
-        headers={"x-railway-secret": secret},
-        files=files,
-        data=data,
-        timeout=timeout,
-    )
+    resp = requests.post(url, headers=headers, data=csv_bytes, timeout=timeout)
+
     if resp.status_code in (200, 201, 204):
         print("Upload OK:", fn, "bytes:", len(csv_bytes))
         return
+
     raise RuntimeError("POST failed " + str(resp.status_code) + ": " + resp.text[:800])
 
 
@@ -226,7 +222,7 @@ def post_df_with_retries(url: str, secret: str, df: pd.DataFrame, remote_filenam
 
     for attempt in (1, 2, 3):
         try:
-            post_csv_dual_keys(url, secret, csv_bytes, fn, timeout)
+            post_csv_raw(url, secret, csv_bytes, fn, timeout)
             return
         except requests.exceptions.Timeout:
             if attempt == 3:
@@ -258,6 +254,7 @@ def post_df_maybe_chunked(url: str, secret: str, df: pd.DataFrame, remote_filena
         post_df_with_retries(url, secret, df, fn, timeout)
         return
 
+    # Disabled by default. Keeping logic for later refactor to multi-part server support.
     total = len(df)
     parts = []
     start = 0
@@ -673,9 +670,6 @@ try:
     if df_full.empty:
         raise RuntimeError("SAM full df empty")
 
-    awarded_set = set()
-    award_map = {}
-
     if "AwardDate" in df_full.columns:
         awarded_rows = df_full.loc[df_full["AwardDate"].notna(), ["Sol#", "AwardDate"]].copy()
         awarded_rows["AwardDate"] = awarded_rows["AwardDate"].astype(str).str[:10]
@@ -728,7 +722,6 @@ try:
 
     front_cols = ["Sol#", "PostedDate", "ResponseDeadLine"]
     front = [c for c in front_cols if c in new_open_df.columns]
-    rest = [c for c in new_open_df.columns if c in front_cols]  # placeholder, kept minimal
     rest = [c for c in new_open_df.columns if c not in front]
     main_up6 = new_open_df.loc[:, front + rest].copy()
 
@@ -792,9 +785,9 @@ try:
         vals = []
         a = r.get("primary_phone_clean")
         b = r.get("secondary_phone_clean")
-        if pd.isna(a) == False:
+        if pd.isna(a) is False:
             vals.append(a)
-        if pd.isna(b) == False:
+        if pd.isna(b) is False:
             vals.append(b)
         s = ", ".join(vals)
         if s == "":
@@ -875,7 +868,7 @@ except Exception as e:
     df7 = df5.copy() if isinstance(df5, pd.DataFrame) else pd.DataFrame()
 
 print("=== STEP 7: DEFAULTS ===")
-if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
+if isinstance(df7, pd.DataFrame) and (df7.empty is False):
     df7["status"] = "open"
     df7["last_update"] = date.today().isoformat()
 
@@ -888,7 +881,7 @@ OUT_CAT = "category_alarm_8_raw"
 COL_NAICS = "2022 NAICS Title"
 COL_PSC = "PRODUCT AND SERVICE CODE NAME"
 
-if (isinstance(df7, pd.DataFrame) is True) and (df7.empty is False):
+if isinstance(df7, pd.DataFrame) and (df7.empty is False):
     if OUT_SUM not in df7.columns:
         df7[OUT_SUM] = ""
     if OUT_CAT not in df7.columns:
@@ -1038,7 +1031,7 @@ if USE_RAILWAY_MODE:
             df_to_push,
             FRESH_REMOTE_FILENAME,
             timeout=UPLOAD_TIMEOUT_SEC,
-            chunk_rows=FRESH_UPLOAD_CHUNK_ROWS
+            chunk_rows=0
         )
         print("Pushed fresh file.")
     except Exception as e:
